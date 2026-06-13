@@ -40,6 +40,10 @@ export function isValidUrl(value) {
   }
 }
 
+export function isTaskStatus(value) {
+  return TASK_STATUSES.includes(value);
+}
+
 export function commandPayload(message) {
   const text = message.text || message.caption || "";
   const parts = text.trim().split(/\s+(.+)/, 2);

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { commandPayload, extractHashtags, isValidUrl, parseAllowedUsers } from "../src/utils.js";
+import { commandPayload, extractHashtags, isTaskStatus, isValidUrl, parseAllowedUsers } from "../src/utils.js";
 
 test("extractHashtags returns unique lower-case tags", () => {
   assert.deepEqual(extractHashtags("Идея #AI #бот #ai #Бот"), ["ai", "бот"]);
@@ -26,4 +26,12 @@ test("commandPayload falls back to reply text", () => {
     }),
     "Ответ с текстом",
   );
+});
+
+test("isTaskStatus accepts only known task states", () => {
+  assert.equal(isTaskStatus("todo"), true);
+  assert.equal(isTaskStatus("doing"), true);
+  assert.equal(isTaskStatus("review"), true);
+  assert.equal(isTaskStatus("done"), true);
+  assert.equal(isTaskStatus("blocked"), false);
 });

@@ -5,6 +5,8 @@
 ## Архитектура
 
 - Cloudflare Worker принимает Telegram webhook на `/telegram/webhook`.
+- Веб-панель доступна на `/app` и работает с той же D1 базой.
+- JSON API веб-панели доступен на `/api/*`.
 - Cloudflare D1 хранит проекты, активный проект чата, идеи, задачи, ссылки, заметки, решения и теги.
 - Wrangler деплоит Worker и применяет D1 migrations.
 - GitHub Actions запускает тесты, применяет миграции, деплоит Worker и настраивает Telegram webhook.
@@ -24,6 +26,55 @@
 - `/find [query]` - поиск по текущему проекту
 
 Команды `/idea`, `/task`, `/note`, `/decision` и `/link` поддерживают reply-режим.
+
+## Веб-панель
+
+Панель предназначена для внутренней работы двух партнёров и закрыта Basic Auth.
+
+Адрес:
+
+```text
+https://bot.michael.kz/app
+```
+
+Возможности MVP:
+
+- список проектов;
+- создание проекта;
+- статистика по задачам, идеям, заметкам, решениям и ссылкам;
+- страница проекта;
+- задачи по статусам `todo`, `doing`, `review`, `done`;
+- смена статуса задачи через select;
+- создание задач, идей, заметок, решений и ссылок;
+- просмотр ссылок с открытием в новой вкладке;
+- поиск по текущему проекту;
+- JSON API для проектов, данных проекта и поиска.
+
+Маршруты:
+
+```text
+GET  /app
+GET  /app/projects
+GET  /app/projects/:id
+POST /app/projects
+POST /app/tasks
+POST /app/tasks/:id/status
+POST /app/ideas
+POST /app/notes
+POST /app/decisions
+POST /app/links
+
+GET  /api/projects
+GET  /api/projects/:id
+GET  /api/search?project_id=1&q=...
+```
+
+Basic Auth задаётся через Worker secrets:
+
+```text
+PANEL_USERNAME
+PANEL_PASSWORD
+```
 
 ## Cloudflare
 
@@ -73,8 +124,10 @@ Settings -> Secrets and variables -> Actions -> New repository secret
 - `ALLOWED_USERS` - Telegram user_id через запятую, например `111111111,222222222`.
 - `WEBHOOK_SECRET` - произвольная секретная строка для проверки Telegram webhook.
 - `WEBHOOK_URL` - полный URL webhook: `https://bot.michael.kz/telegram/webhook`.
+- `PANEL_USERNAME` - логин для веб-панели.
+- `PANEL_PASSWORD` - пароль для веб-панели.
 
-Workflow сам загрузит `BOT_TOKEN`, `WEBHOOK_SECRET` и `ALLOWED_USERS` в Worker secrets через Wrangler.
+Workflow сам загрузит `BOT_TOKEN`, `WEBHOOK_SECRET`, `ALLOWED_USERS`, `PANEL_USERNAME` и `PANEL_PASSWORD` в Worker secrets через Wrangler.
 
 ## Деплой через GitHub
 
@@ -115,6 +168,12 @@ Webhook endpoint:
 
 ```text
 https://bot.michael.kz/telegram/webhook
+```
+
+Веб-панель:
+
+```text
+https://bot.michael.kz/app
 ```
 
 ## Legacy Python

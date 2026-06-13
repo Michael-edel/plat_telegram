@@ -6,6 +6,7 @@ import {
   parseAllowedUsers,
   truncateText,
 } from "./utils.js";
+import { handleWebRequest } from "./web.js";
 
 function json(data, init = {}) {
   return new Response(JSON.stringify(data), {
@@ -372,6 +373,10 @@ export default {
 
     if (url.pathname === "/health") {
       return json({ status: "ok" });
+    }
+
+    if (url.pathname === "/" || url.pathname.startsWith("/app") || url.pathname.startsWith("/api")) {
+      return await handleWebRequest(request, env);
     }
 
     if (url.pathname !== "/telegram/webhook") {
