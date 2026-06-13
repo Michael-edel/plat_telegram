@@ -10,6 +10,7 @@
 - Cloudflare D1 хранит проекты, активный проект чата, идеи, задачи, ссылки, заметки, решения и теги.
 - Wrangler деплоит Worker и применяет D1 migrations.
 - GitHub Actions запускает тесты, применяет миграции, деплоит Worker и настраивает Telegram webhook.
+- Scheduled Trigger каждые 30 минут проверяет дедлайны задач и отправляет Telegram-уведомления.
 
 ## Команды бота
 
@@ -67,7 +68,9 @@ https://bot.michael.kz/login
 - дедлайны задач;
 - ответственные за задачи;
 - история изменений по проекту;
-- фильтры проекта по статусу, автору и тегу;
+- фильтры проекта по статусу, автору, ответственному, приоритету, дедлайну и тегу;
+- фильтр истории изменений по типу сущности и пользователю;
+- обзор рисков: просроченные задачи и задачи с ближайшим дедлайном;
 - поиск по проекту с учётом выбранного тега;
 - отображение тегов на карточках задач, идей, заметок, решений и ссылок;
 - смена статуса задачи через select;
@@ -79,6 +82,7 @@ https://bot.michael.kz/login
 - аудит действий для `admin` с фильтрами по пользователю, действию и типу сущности;
 - просмотр и восстановление мягко удалённых записей для `admin`;
 - экспорт проекта в Markdown, CSV и JSON;
+- Telegram-уведомления о назначении ответственного, смене статуса, ближайшем дедлайне и просрочке;
 - JSON API для проектов, данных проекта и поиска.
 
 Маршруты:
@@ -194,8 +198,10 @@ Settings -> Secrets and variables -> Actions -> New repository secret
 - `SESSION_SECRET` - длинный секрет для подписи web sessions и CSRF.
 - `INITIAL_ADMIN_USERNAME` - логин первого admin, если `users` ещё пустая.
 - `INITIAL_ADMIN_PASSWORD` - пароль первого admin, если `users` ещё пустая.
+- `TASK_DUE_SOON_HOURS` - окно ближайшего дедлайна в часах, по умолчанию `24`.
+- `TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID` - необязательный общий чат/канал для уведомлений о статусах и дедлайнах.
 
-Workflow сам загрузит `BOT_TOKEN`, `WEBHOOK_SECRET`, `ALLOWED_USERS`, `SESSION_SECRET`, `INITIAL_ADMIN_USERNAME` и `INITIAL_ADMIN_PASSWORD` в Worker secrets через Wrangler.
+Workflow сам загрузит `BOT_TOKEN`, `WEBHOOK_SECRET`, `ALLOWED_USERS`, `SESSION_SECRET`, `INITIAL_ADMIN_USERNAME`, `INITIAL_ADMIN_PASSWORD`, `TASK_DUE_SOON_HOURS` и, если задан, `TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID` в Worker secrets через Wrangler.
 
 ## Деплой через GitHub
 

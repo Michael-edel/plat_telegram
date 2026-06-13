@@ -135,7 +135,7 @@ export async function getOrCreateProject(db, name, userId = null, source = "web"
   return project;
 }
 
-export async function listProjects(db) {
+export async function listProjects(db, dueSoonDays = 3) {
   const { results } = await db
     .prepare(
       `SELECT
@@ -149,12 +149,15 @@ export async function listProjects(db) {
         (SELECT COUNT(*) FROM ideas WHERE project_id = p.id AND is_deleted = 0) AS ideas_count,
         (SELECT COUNT(*) FROM notes WHERE project_id = p.id AND is_deleted = 0) AS notes_count,
         (SELECT COUNT(*) FROM decisions WHERE project_id = p.id AND is_deleted = 0) AS decisions_count,
-        (SELECT COUNT(*) FROM links WHERE project_id = p.id AND is_deleted = 0) AS links_count
+        (SELECT COUNT(*) FROM links WHERE project_id = p.id AND is_deleted = 0) AS links_count,
+        (SELECT COUNT(*) FROM tasks WHERE project_id = p.id AND is_deleted = 0 AND status != 'done' AND due_date IS NOT NULL AND date(due_date) < date('now')) AS overdue_count,
+        (SELECT COUNT(*) FROM tasks WHERE project_id = p.id AND is_deleted = 0 AND status != 'done' AND due_date IS NOT NULL AND date(due_date) >= date('now') AND date(due_date) <= date('now', '+' || ? || ' days')) AS due_soon_count
       FROM projects p
       LEFT JOIN tasks t ON t.project_id = p.id
       GROUP BY p.id
       ORDER BY p.name`,
     )
+    .bind(dueSoonDays)
     .all();
   return results;
 }
@@ -176,6 +179,28 @@ export async function loadProjectData(db, projectId, filters = {}) {
   if (filters.status) {
     taskFilters.whereSql += " AND t.status = ?";
     taskFilters.bindings.push(filters.status);
+  }
+  if (filters.priority) {
+    taskFilters.whereSql += " AND t.priority = ?";
+    taskFilters.bindings.push(filters.priority);
+  }
+  if (filters.assigneeId === "none") {
+    taskFilters.whereSql += " AND t.assignee_id IS NULL";
+  } else if (filters.assigneeId) {
+    taskFilters.whereSql += " AND t.assignee_id = ?";
+    taskFilters.bindings.push(filters.assigneeId);
+  }
+  if (filters.deadline === "none") {
+    taskFilters.whereSql += " AND t.due_date IS NULL";
+  }
+  if (filters.deadline === "today") {
+    taskFilters.whereSql += " AND date(t.due_date) = date('now')";
+  }
+  if (filters.deadline === "week") {
+    taskFilters.whereSql += " AND t.due_date IS NOT NULL AND date(t.due_date) >= date('now') AND date(t.due_date) <= date('now', '+7 days')";
+  }
+  if (filters.deadline === "overdue") {
+    taskFilters.whereSql += " AND t.due_date IS NOT NULL AND date(t.due_date) < date('now') AND t.status != 'done'";
   }
 
   const [tasks, ideas, notes, decisions, links] = await Promise.all([
@@ -307,6 +332,7 @@ export async function createTask(db, { projectId, text, authorId = null, source 
     entityId: task.id,
     details: { project_id: projectId, source },
   });
+  await changeLog(db, { userId: authorId, entityType: "task", entityId: task.id, fieldName: "created", oldValue: null, newValue: cleanText });
   return task;
 }
 
@@ -342,6 +368,7 @@ export async function updateTaskStatus(db, { taskId, projectId, status, userId, 
     oldValue: existing.status,
     newValue: status,
   });
+  return { taskId, projectId, oldStatus: existing.status, newStatus: status };
 }
 
 export async function updateTaskText(db, { taskId, projectId, text, userId }) {
@@ -391,9 +418,19 @@ export async function updateTaskMeta(db, { taskId, projectId, priority, dueDate,
   const nextPriority = cleanTaskPriority(priority);
   const nextDueDate = cleanDate(dueDate);
   const nextAssigneeId = cleanAssigneeId(assigneeId);
+  const dueDateChanged = String(existing.due_date || "") !== String(nextDueDate || "");
   await db
-    .prepare("UPDATE tasks SET priority = ?, due_date = ?, assignee_id = ?, updated_at = datetime('now') WHERE id = ? AND project_id = ? AND is_deleted = 0")
-    .bind(nextPriority, nextDueDate, nextAssigneeId, taskId, projectId)
+    .prepare(
+      `UPDATE tasks
+       SET priority = ?,
+           due_date = ?,
+           assignee_id = ?,
+           due_soon_notified_at = CASE WHEN ? THEN NULL ELSE due_soon_notified_at END,
+           overdue_notified_at = CASE WHEN ? THEN NULL ELSE overdue_notified_at END,
+           updated_at = datetime('now')
+       WHERE id = ? AND project_id = ? AND is_deleted = 0`,
+    )
+    .bind(nextPriority, nextDueDate, nextAssigneeId, dueDateChanged ? 1 : 0, dueDateChanged ? 1 : 0, taskId, projectId)
     .run();
 
   await Promise.all([
@@ -408,6 +445,14 @@ export async function updateTaskMeta(db, { taskId, projectId, priority, dueDate,
     entityId: taskId,
     details: { project_id: projectId, priority: nextPriority, due_date: nextDueDate, assignee_id: nextAssigneeId, source: "web" },
   });
+  return {
+    taskId,
+    projectId,
+    oldAssigneeId: existing.assignee_id,
+    newAssigneeId: nextAssigneeId,
+    oldDueDate: existing.due_date,
+    newDueDate: nextDueDate,
+  };
 }
 
 export async function softDeleteTask(db, { taskId, projectId, userId }) {
@@ -422,6 +467,7 @@ export async function softDeleteTask(db, { taskId, projectId, userId }) {
     entityId: taskId,
     details: { project_id: projectId, source: "web" },
   });
+  await changeLog(db, { userId, entityType: "task", entityId: taskId, fieldName: "deleted", oldValue: "0", newValue: "1" });
 }
 
 export async function createTextEntity(db, { table, entityType, projectId, text, authorId = null, source = "web" }) {
@@ -445,6 +491,7 @@ export async function createTextEntity(db, { table, entityType, projectId, text,
     entityId: row.id,
     details: { project_id: projectId, source },
   });
+  await changeLog(db, { userId: authorId, entityType, entityId: row.id, fieldName: "created", oldValue: null, newValue: cleanText });
   return row;
 }
 
@@ -499,6 +546,7 @@ export async function softDeleteTextEntity(db, { table, entityType, entityId, pr
     entityId,
     details: { project_id: projectId, source: "web" },
   });
+  await changeLog(db, { userId, entityType, entityId, fieldName: "deleted", oldValue: "0", newValue: "1" });
 }
 
 export async function createLink(db, { projectId, url, description, authorId = null, source = "web" }) {
@@ -518,6 +566,7 @@ export async function createLink(db, { projectId, url, description, authorId = n
     entityId: link.id,
     details: { project_id: projectId, source },
   });
+  await changeLog(db, { userId: authorId, entityType: "link", entityId: link.id, fieldName: "created", oldValue: null, newValue: cleanUrl });
   return link;
 }
 
@@ -558,6 +607,7 @@ export async function softDeleteLink(db, { linkId, projectId, userId }) {
     entityId: linkId,
     details: { project_id: projectId, source: "web" },
   });
+  await changeLog(db, { userId, entityType: "link", entityId: linkId, fieldName: "deleted", oldValue: "0", newValue: "1" });
 }
 
 export async function searchProject(db, projectId, query, filters = {}) {
@@ -674,7 +724,17 @@ export async function listAudit(db, filters = {}, limit = 100) {
   return results;
 }
 
-export async function listProjectChanges(db, projectId, limit = 100) {
+export async function listProjectChanges(db, projectId, filters = {}, limit = 100) {
+  const conditions = ["COALESCE(t.project_id, i.project_id, n.project_id, d.project_id, l.project_id) = ?"];
+  const bindings = [projectId];
+  if (filters.entityType) {
+    conditions.push("c.entity_type = ?");
+    bindings.push(filters.entityType);
+  }
+  if (filters.userId) {
+    conditions.push("c.user_id = ?");
+    bindings.push(filters.userId);
+  }
   const { results } = await db
     .prepare(
       `SELECT c.id, c.entity_type, c.entity_id, c.field_name, c.old_value, c.new_value, c.created_at,
@@ -686,11 +746,11 @@ export async function listProjectChanges(db, projectId, limit = 100) {
        LEFT JOIN notes n ON c.entity_type = 'note' AND c.entity_id = n.id
        LEFT JOIN decisions d ON c.entity_type = 'decision' AND c.entity_id = d.id
        LEFT JOIN links l ON c.entity_type = 'link' AND c.entity_id = l.id
-       WHERE COALESCE(t.project_id, i.project_id, n.project_id, d.project_id, l.project_id) = ?
+       WHERE ${conditions.join(" AND ")}
        ORDER BY c.created_at DESC
        LIMIT ?`,
     )
-    .bind(projectId, limit)
+    .bind(...bindings, limit)
     .all();
   return results;
 }
@@ -736,5 +796,6 @@ export async function restoreEntity(db, { entityType, entityId, userId }) {
     entityId,
     details: { project_id: existing.project_id, source: "web" },
   });
+  await changeLog(db, { userId, entityType, entityId, fieldName: "restored", oldValue: "1", newValue: "0" });
   return existing;
 }

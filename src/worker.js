@@ -6,6 +6,7 @@ import {
   truncateText,
 } from "./utils.js";
 import { handleWebRequest } from "./web.js";
+import { notifyTaskStatusChanged, runTaskDeadlineNotifications } from "./notifications.js";
 import {
   createLink,
   createTask,
@@ -200,13 +201,14 @@ async function handleTaskStatusCommand(env, message, user, status, commandName) 
   if (!project) return;
 
   try {
-    await updateTaskStatus(env.DB, {
+    const result = await updateTaskStatus(env.DB, {
       taskId,
       projectId: project.id,
       status,
       userId: user?.id || null,
       source: "telegram",
     });
+    await notifyTaskStatusChanged(env, result.taskId, result.oldStatus, result.newStatus);
   } catch {
     await sendMessage(env, message.chat.id, "Задача не найдена в текущем проекте.");
     return;
@@ -397,6 +399,10 @@ async function handleTelegramUpdate(env, update) {
 }
 
 export default {
+  async scheduled(_event, env, _ctx) {
+    await runTaskDeadlineNotifications(env);
+  },
+
   async fetch(request, env) {
     const url = new URL(request.url);
 

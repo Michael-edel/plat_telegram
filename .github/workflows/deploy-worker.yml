@@ -44,6 +44,10 @@ jobs:
           printf "%s" "$SESSION_SECRET" | npx wrangler secret put SESSION_SECRET
           printf "%s" "$INITIAL_ADMIN_USERNAME" | npx wrangler secret put INITIAL_ADMIN_USERNAME
           printf "%s" "$INITIAL_ADMIN_PASSWORD" | npx wrangler secret put INITIAL_ADMIN_PASSWORD
+          printf "%s" "$TASK_DUE_SOON_HOURS" | npx wrangler secret put TASK_DUE_SOON_HOURS
+          if [ -n "$TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID" ]; then
+            printf "%s" "$TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID" | npx wrangler secret put TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID
+          fi
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -53,6 +57,8 @@ jobs:
           SESSION_SECRET: ${{ secrets.SESSION_SECRET || secrets.WEBHOOK_SECRET }}
           INITIAL_ADMIN_USERNAME: ${{ secrets.INITIAL_ADMIN_USERNAME || secrets.PANEL_USERNAME }}
           INITIAL_ADMIN_PASSWORD: ${{ secrets.INITIAL_ADMIN_PASSWORD || secrets.PANEL_PASSWORD }}
+          TASK_DUE_SOON_HOURS: ${{ secrets.TASK_DUE_SOON_HOURS || '24' }}
+          TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID: ${{ secrets.TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID }}
 
       - name: Configure Telegram webhook
         run: node scripts/set-webhook.mjs

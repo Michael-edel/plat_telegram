@@ -11,3 +11,6 @@ routes = [
 binding = "DB"
 database_name = "plat_telegram"
 database_id = "e9450fe2-08cc-4f04-b9d9-14e9ce6d0c8b"
+
+[triggers]
+crons = ["*/30 * * * *"]

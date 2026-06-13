@@ -43,6 +43,7 @@ import {
   updateTaskText,
   updateTextEntity,
 } from "./repository.js";
+import { notifyTaskAssigned, notifyTaskStatusChanged, runTaskDeadlineNotifications } from "./notifications.js";
 import { isTaskStatus, isValidUrl } from "./utils.js";
 
 const ENTITY_PATHS = {
@@ -122,6 +123,11 @@ function isAdmin(user) {
 
 function canManageProjects(user) {
   return requireRole(user, ["admin", "manager"]);
+}
+
+function dueSoonDays(env) {
+  const hours = Number.parseInt(env.TASK_DUE_SOON_HOURS || "", 10);
+  return Number.isInteger(hours) && hours > 0 ? Math.max(1, Math.ceil(hours / 24)) : 3;
 }
 
 function forbiddenResponse(isApi) {
@@ -254,6 +260,8 @@ function renderLayout({ title, content, user, csrfToken }) {
     .filters { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)) auto; gap: 8px; align-items: end; margin-bottom: 12px; }
     .section-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
     .badge { display: inline-flex; align-items: center; border-radius: 999px; padding: 2px 8px; font-size: 12px; background: #e5e7eb; color: #111827; }
+    .danger-badge { background: #fee4e2; color: #912018; }
+    .warning-badge { background: #fef3c7; color: #92400e; }
     .tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
     .role-admin { background: #fee4e2; color: #912018; }
     .role-manager { background: #fef3c7; color: #92400e; }
@@ -378,15 +386,26 @@ function renderTags(tags) {
 function projectFilterParams(url) {
   const status = cleanFilter(url.searchParams.get("status"));
   const authorId = Number.parseInt(url.searchParams.get("author_id") || "", 10);
+  const assignee = cleanFilter(url.searchParams.get("assignee_id"));
+  const assigneeId = assignee === "none" ? "none" : Number.parseInt(assignee || "", 10);
+  const priority = cleanFilter(url.searchParams.get("priority"));
+  const deadline = cleanFilter(url.searchParams.get("deadline"));
+  const changeUserId = Number.parseInt(url.searchParams.get("change_user_id") || "", 10);
+  const changeEntityType = cleanFilter(url.searchParams.get("change_entity_type"));
   return {
     q: cleanFilter(url.searchParams.get("q")),
     status: isTaskStatus(status) ? status : "",
     authorId: Number.isInteger(authorId) ? authorId : "",
+    priority: TASK_PRIORITIES.includes(priority) ? priority : "",
+    assigneeId: assigneeId === "none" || Number.isInteger(assigneeId) ? assigneeId : "",
+    deadline: ["", "none", "today", "week", "overdue"].includes(deadline) ? deadline : "",
+    changeUserId: Number.isInteger(changeUserId) ? changeUserId : "",
+    changeEntityType: ["", "task", "idea", "note", "decision", "link"].includes(changeEntityType) ? changeEntityType : "",
     tag: cleanFilter(url.searchParams.get("tag")).replace(/^#/, "").toLowerCase(),
   };
 }
 
-function renderDashboard(projects, user, csrfToken) {
+function renderDashboard(projects, user, csrfToken, riskWindowDays) {
   const totals = projects.reduce(
     (acc, project) => {
       acc.todo += Number(project.todo_count || 0);
@@ -397,9 +416,11 @@ function renderDashboard(projects, user, csrfToken) {
       acc.notes += Number(project.notes_count || 0);
       acc.decisions += Number(project.decisions_count || 0);
       acc.links += Number(project.links_count || 0);
+      acc.overdue += Number(project.overdue_count || 0);
+      acc.dueSoon += Number(project.due_soon_count || 0);
       return acc;
     },
-    { todo: 0, doing: 0, review: 0, done: 0, ideas: 0, notes: 0, decisions: 0, links: 0 },
+    { todo: 0, doing: 0, review: 0, done: 0, ideas: 0, notes: 0, decisions: 0, links: 0, overdue: 0, dueSoon: 0 },
   );
 
   const projectRows = projects.length
@@ -410,6 +431,7 @@ function renderDashboard(projects, user, csrfToken) {
               <h3>${escapeHtml(project.name)}</h3>
               <p class="muted">Задачи: todo ${Number(project.todo_count || 0)}, doing ${Number(project.doing_count || 0)}, review ${Number(project.review_count || 0)}, done ${Number(project.done_count || 0)}</p>
               <p class="muted">Идеи ${Number(project.ideas_count || 0)} · Заметки ${Number(project.notes_count || 0)} · Решения ${Number(project.decisions_count || 0)} · Ссылки ${Number(project.links_count || 0)}</p>
+              <p>${Number(project.overdue_count || 0) ? `<span class="badge danger-badge">Просрочено: ${Number(project.overdue_count || 0)}</span>` : `<span class="badge">Просрочено: 0</span>`} <span class="badge">Дедлайн ≤ ${riskWindowDays} дн.: ${Number(project.due_soon_count || 0)}</span></p>
             </div>
             <a class="button" href="/app/projects/${project.id}">Открыть</a>
           </article>`,
@@ -440,6 +462,8 @@ function renderDashboard(projects, user, csrfToken) {
       <div class="stat"><strong>${totals.notes}</strong><span>заметок</span></div>
       <div class="stat"><strong>${totals.decisions}</strong><span>решений</span></div>
       <div class="stat"><strong>${totals.links}</strong><span>ссылок</span></div>
+      <div class="stat"><strong>${totals.overdue}</strong><span>просрочено</span></div>
+      <div class="stat"><strong>${totals.dueSoon}</strong><span>дедлайн ≤ ${riskWindowDays} дн.</span></div>
     </section>
     <div class="grid two">
       <section class="panel"><h2>Список проектов</h2><div class="project-list">${projectRows}</div></section>
@@ -568,11 +592,29 @@ function renderSearchResults(results, query) {
     .join("")}</div>`;
 }
 
-function renderChangeLog(rows) {
+function renderChangeLog(rows, projectId, filters, authors) {
+  const entityOptions = ["", "task", "idea", "note", "decision", "link"]
+    .map((type) => `<option value="${type}" ${selected(type, filters.changeEntityType)}>${type || "Все типы"}</option>`)
+    .join("");
+  const userOptions = [{ id: "", name: "Все пользователи" }, ...authors]
+    .map((author) => `<option value="${author.id}" ${selected(author.id, filters.changeUserId)}>${escapeHtml(author.name)}</option>`)
+    .join("");
+  const filterForm = `<form class="filters" method="get" action="/app/projects/${projectId}">
+    <input type="hidden" name="status" value="${escapeHtml(filters.status)}">
+    <input type="hidden" name="priority" value="${escapeHtml(filters.priority)}">
+    <input type="hidden" name="author_id" value="${escapeHtml(filters.authorId)}">
+    <input type="hidden" name="assignee_id" value="${escapeHtml(filters.assigneeId)}">
+    <input type="hidden" name="deadline" value="${escapeHtml(filters.deadline)}">
+    <input type="hidden" name="tag" value="${escapeHtml(filters.tag)}">
+    <input type="hidden" name="q" value="${escapeHtml(filters.q)}">
+    <label>Тип<select name="change_entity_type">${entityOptions}</select></label>
+    <label>Пользователь<select name="change_user_id">${userOptions}</select></label>
+    <button type="submit">История</button>
+  </form>`;
   if (!rows.length) {
-    return `<p class="muted">Истории изменений пока нет.</p>`;
+    return `${filterForm}<p class="muted">Истории изменений пока нет.</p>`;
   }
-  return `<table><thead><tr><th>Дата</th><th>Кто</th><th>Сущность</th><th>Поле</th><th>Было</th><th>Стало</th></tr></thead><tbody>${rows
+  return `${filterForm}<table><thead><tr><th>Дата</th><th>Кто</th><th>Сущность</th><th>Поле</th><th>Было</th><th>Стало</th></tr></thead><tbody>${rows
     .map(
       (row) => `<tr>
         <td>${escapeHtml(formatDate(row.created_at))}</td>
@@ -628,8 +670,23 @@ function renderProject(project, data, searchResults, filters, filterOptions, use
   const statusOptions = ["", "todo", "doing", "review", "done"]
     .map((status) => `<option value="${status}" ${selected(status, filters.status)}>${status || "Все статусы"}</option>`)
     .join("");
+  const priorityOptions = ["", ...TASK_PRIORITIES]
+    .map((priority) => `<option value="${priority}" ${selected(priority, filters.priority)}>${priority || "Все приоритеты"}</option>`)
+    .join("");
   const authorOptions = [{ id: "", name: "Все авторы" }, ...filterOptions.authors]
     .map((author) => `<option value="${author.id}" ${selected(author.id, filters.authorId)}>${escapeHtml(author.name)}</option>`)
+    .join("");
+  const assigneeOptions = [{ id: "", name: "Все ответственные" }, { id: "none", name: "Без ответственного" }, ...filterOptions.assignableUsers]
+    .map((item) => `<option value="${item.id}" ${selected(item.id, filters.assigneeId)}>${escapeHtml(item.name || item.display_name || item.username)}</option>`)
+    .join("");
+  const deadlineOptions = [
+    ["", "Все дедлайны"],
+    ["none", "Без дедлайна"],
+    ["today", "Сегодня"],
+    ["week", "На этой неделе"],
+    ["overdue", "Просроченные"],
+  ]
+    .map(([value, label]) => `<option value="${value}" ${selected(value, filters.deadline)}>${label}</option>`)
     .join("");
   const tagOptions = [{ name: "" }, ...filterOptions.tags]
     .map((tag) => `<option value="${escapeHtml(tag.name)}" ${selected(tag.name, filters.tag)}>${tag.name ? `#${escapeHtml(tag.name)}` : "Все теги"}</option>`)
@@ -640,16 +697,27 @@ function renderProject(project, data, searchResults, filters, filterOptions, use
       return `<section class="column"><h3>${status}</h3>${tasks.length ? tasks.map((task) => renderTask(task, project.id, user, csrfToken, filterOptions.assignableUsers)).join("") : `<p class="muted">Нет задач.</p>`}</section>`;
     })
     .join("");
+  const overdueCount = data.tasks.filter((task) => task.status !== "done" && task.due_date && task.due_date < filterOptions.today).length;
+  const dueSoonCount = data.tasks.filter(
+    (task) => task.status !== "done" && task.due_date && task.due_date >= filterOptions.today && task.due_date <= filterOptions.dueSoonDate,
+  ).length;
 
   return `<div class="topbar">
       <div><h1>${escapeHtml(project.name)}</h1><p class="muted">Создан: ${escapeHtml(formatDate(project.created_at))}</p></div>
       <div class="inline-form"><a class="button secondary" href="/app">Все проекты</a><a class="button secondary" href="/app/projects/${project.id}/export.md">Markdown</a><a class="button secondary" href="/app/projects/${project.id}/export.csv">CSV</a><a class="button secondary" href="/app/projects/${project.id}/export.json">JSON</a></div>
     </div>
     <section class="panel" id="search">
+      <div class="inline-form" style="margin-bottom:12px">
+        <span class="badge ${overdueCount ? "danger-badge" : ""}">Просрочено: ${overdueCount}</span>
+        <span class="badge ${dueSoonCount ? "warning-badge" : ""}">Дедлайн ≤ ${filterOptions.riskWindowDays} дн.: ${dueSoonCount}</span>
+      </div>
       <h2>Фильтры и поиск</h2>
       <form class="filters" method="get" action="/app/projects/${project.id}">
         <label>Статус<select name="status">${statusOptions}</select></label>
+        <label>Приоритет<select name="priority">${priorityOptions}</select></label>
         <label>Автор<select name="author_id">${authorOptions}</select></label>
+        <label>Ответственный<select name="assignee_id">${assigneeOptions}</select></label>
+        <label>Дедлайн<select name="deadline">${deadlineOptions}</select></label>
         <label>Тег<select name="tag">${tagOptions}</select></label>
         <label>Поиск<input name="q" value="${escapeHtml(query)}" placeholder="Текст"></label>
         <button type="submit">Найти</button>
@@ -660,7 +728,7 @@ function renderProject(project, data, searchResults, filters, filterOptions, use
     <div class="grid two" style="margin-top:16px">
       <div class="grid">
         <section class="panel" id="tasks"><h2>Задачи</h2><div class="columns">${taskColumns}</div></section>
-        <section class="panel" id="changes"><h2>История изменений</h2>${renderChangeLog(filterOptions.changes)}</section>
+        <section class="panel" id="changes"><h2>История изменений</h2>${renderChangeLog(filterOptions.changes, project.id, filters, filterOptions.authors)}</section>
         <div class="section-grid">
           <section class="panel" id="ideas"><h2>Идеи</h2><div class="items">${renderTextCards(data.ideas, "ideas", project.id, user, csrfToken)}</div></section>
           <section class="panel" id="notes"><h2>Заметки</h2><div class="items">${renderTextCards(data.notes, "notes", project.id, user, csrfToken)}</div></section>
@@ -892,11 +960,13 @@ async function handleLogout(request, env, user) {
 }
 
 async function handleDashboard(env, user) {
-  const projects = await listProjects(env.DB);
+  await runTaskDeadlineNotifications(env);
+  const riskWindowDays = dueSoonDays(env);
+  const projects = await listProjects(env.DB, riskWindowDays);
   const csrfToken = await createCsrfToken(env);
   const headers = new Headers();
   appendSetCookie(headers, createCsrfCookie(csrfToken));
-  return html(renderLayout({ title: "Проекты", content: renderDashboard(projects, user, csrfToken), user, csrfToken }), { headers });
+  return html(renderLayout({ title: "Проекты", content: renderDashboard(projects, user, csrfToken, riskWindowDays), user, csrfToken }), { headers });
 }
 
 async function handleProjectPage(env, request, user, projectId) {
@@ -904,18 +974,22 @@ async function handleProjectPage(env, request, user, projectId) {
   if (!project) return renderErrorPage("Проект не найден", 404);
   const url = new URL(request.url);
   const filters = projectFilterParams(url);
+  await runTaskDeadlineNotifications(env);
+  const riskWindowDays = dueSoonDays(env);
+  const today = new Date().toISOString().slice(0, 10);
+  const dueSoonDate = new Date(Date.now() + riskWindowDays * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const [data, searchResults, authors, tags, assignableUsers, changes] = await Promise.all([
     loadProjectData(env.DB, project.id, filters),
     filters.q ? searchProject(env.DB, project.id, filters.q, filters) : Promise.resolve([]),
     listProjectAuthors(env.DB, project.id),
     listProjectTags(env.DB, project.id),
     listAssignableUsers(env.DB),
-    listProjectChanges(env.DB, project.id),
+    listProjectChanges(env.DB, project.id, { entityType: filters.changeEntityType, userId: filters.changeUserId }),
   ]);
   const csrfToken = await createCsrfToken(env);
   const headers = new Headers();
   appendSetCookie(headers, createCsrfCookie(csrfToken));
-  return html(renderLayout({ title: project.name, content: renderProject(project, data, searchResults, filters, { authors, tags, assignableUsers, changes }, user, csrfToken), user, csrfToken }), {
+  return html(renderLayout({ title: project.name, content: renderProject(project, data, searchResults, filters, { authors, tags, assignableUsers, changes, today, dueSoonDate, riskWindowDays }, user, csrfToken), user, csrfToken }), {
     headers,
   });
 }
@@ -933,7 +1007,7 @@ async function handleCreateTask(env, request, user) {
   const data = await readRequestData(request);
   await requireCsrf(request, env, data);
   const projectId = Number.parseInt(data.project_id, 10);
-  await createTask(env.DB, {
+  const task = await createTask(env.DB, {
     projectId,
     text: String(data.text || ""),
     authorId: user.id,
@@ -942,6 +1016,7 @@ async function handleCreateTask(env, request, user) {
     dueDate: String(data.due_date || ""),
     assigneeId: data.assignee_id,
   });
+  await notifyTaskAssigned(env, task.id, null, task.assignee_id);
   return redirect(projectRedirect(projectId));
 }
 
@@ -950,7 +1025,8 @@ async function handleTaskStatus(env, request, user, taskId) {
   const data = await readRequestData(request);
   await requireCsrf(request, env, data);
   const projectId = Number.parseInt(data.project_id, 10);
-  await updateTaskStatus(env.DB, { taskId, projectId, status: String(data.status || ""), userId: user.id });
+  const result = await updateTaskStatus(env.DB, { taskId, projectId, status: String(data.status || ""), userId: user.id });
+  await notifyTaskStatusChanged(env, result.taskId, result.oldStatus, result.newStatus);
   return redirect(projectRedirect(projectId));
 }
 
@@ -968,7 +1044,7 @@ async function handleTaskMeta(env, request, user, taskId) {
   const data = await readRequestData(request);
   await requireCsrf(request, env, data);
   const projectId = Number.parseInt(data.project_id, 10);
-  await updateTaskMeta(env.DB, {
+  const result = await updateTaskMeta(env.DB, {
     taskId,
     projectId,
     priority: String(data.priority || "normal"),
@@ -976,6 +1052,7 @@ async function handleTaskMeta(env, request, user, taskId) {
     assigneeId: data.assignee_id,
     userId: user.id,
   });
+  await notifyTaskAssigned(env, result.taskId, result.oldAssigneeId, result.newAssigneeId);
   return redirect(projectRedirect(projectId));
 }
 
@@ -1287,6 +1364,7 @@ async function handleApi(env, request, url, user) {
       dueDate: String(data.due_date || ""),
       assigneeId: data.assignee_id,
     });
+    await notifyTaskAssigned(env, task.id, null, task.assignee_id);
     return json({ task }, { status: 201 });
   }
 
@@ -1294,9 +1372,12 @@ async function handleApi(env, request, url, user) {
   if (taskAction) {
     const taskId = Number.parseInt(taskAction[1], 10);
     const projectId = Number.parseInt(data.project_id, 10);
-    if (taskAction[2] === "status") await updateTaskStatus(env.DB, { taskId, projectId, status: String(data.status || ""), userId: user.id });
+    if (taskAction[2] === "status") {
+      const result = await updateTaskStatus(env.DB, { taskId, projectId, status: String(data.status || ""), userId: user.id });
+      await notifyTaskStatusChanged(env, result.taskId, result.oldStatus, result.newStatus);
+    }
     if (taskAction[2] === "meta") {
-      await updateTaskMeta(env.DB, {
+      const result = await updateTaskMeta(env.DB, {
         taskId,
         projectId,
         priority: String(data.priority || "normal"),
@@ -1304,6 +1385,7 @@ async function handleApi(env, request, url, user) {
         assigneeId: data.assignee_id,
         userId: user.id,
       });
+      await notifyTaskAssigned(env, result.taskId, result.oldAssigneeId, result.newAssigneeId);
     }
     if (taskAction[2] === "edit") await updateTaskText(env.DB, { taskId, projectId, text: String(data.text || ""), userId: user.id });
     if (taskAction[2] === "delete") await softDeleteTask(env.DB, { taskId, projectId, userId: user.id });
