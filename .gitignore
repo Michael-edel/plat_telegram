@@ -1,11 +1,13 @@
 .env
 .venv/
 venv/
+node_modules/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.wrangler/
 data/
 *.db
 *.sqlite

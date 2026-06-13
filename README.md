@@ -1,134 +1,17 @@
-# Telegram-бот для совместной работы
+# Telegram-бот на Cloudflare Workers
 
-Production-ready MVP Telegram-бота для двух партнёров: проекты, идеи, задачи, ссылки, заметки, решения и поиск.
+Проект переведён на запуск через Cloudflare Workers, D1 и Wrangler. Docker и локальный Python-сервер больше не нужны для production-сценария: деплой выполняется из GitHub Actions.
 
-## Стек
+## Архитектура
 
-- Python 3.12+
-- aiogram 3.x
-- SQLAlchemy 2.x Async ORM
-- SQLite через aiosqlite
-- pydantic-settings
-- Docker
-- pytest
+- Cloudflare Worker принимает Telegram webhook на `/telegram/webhook`.
+- Cloudflare D1 хранит проекты, активный проект чата, идеи, задачи, ссылки, заметки, решения и теги.
+- Wrangler деплоит Worker и применяет D1 migrations.
+- GitHub Actions запускает тесты, применяет миграции, деплоит Worker и настраивает Telegram webhook.
 
-## Структура
+## Команды бота
 
-```text
-app/
-  core/          # конфиг и БД
-  handlers/      # Telegram-команды
-  keyboards/     # inline-клавиатуры
-  middlewares/   # контроль доступа
-  models/        # ORM-модели
-  repositories/  # работа с БД
-  services/      # бизнес-логика
-  utils/         # утилиты
-tests/           # базовые тесты
-```
-
-## Локальный запуск
-
-```bash
-python -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-python -m app.main
-```
-
-На Windows PowerShell:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-Copy-Item .env.example .env
-python -m app.main
-```
-
-## Docker
-
-```bash
-cp .env.example .env
-docker compose up --build
-```
-
-SQLite хранится в persistent volume `bot_data`.
-
-## Запуск через Cloudflare HTTPS
-
-Бот поддерживает два режима:
-
-- `APP_MODE=polling` - локальная разработка без публичного HTTPS.
-- `APP_MODE=webhook` - запуск через публичный HTTPS URL, например через Cloudflare Tunnel.
-
-Для работы через Cloudflare Dashboard настройте Tunnel так, чтобы публичный hostname вёл на локальный сервис:
-
-```text
-http://bot:8080
-```
-
-Если бот запущен не внутри `docker-compose`, а напрямую на сервере, укажите origin service:
-
-```text
-http://localhost:8080
-```
-
-Пример `.env` для Cloudflare:
-
-```env
-APP_MODE=webhook
-WEBHOOK_BASE_URL=https://bot.example.com
-WEBHOOK_PATH=/telegram/webhook
-WEBHOOK_SECRET=change-this-secret-token
-WEB_SERVER_HOST=0.0.0.0
-WEB_SERVER_PORT=8080
-```
-
-`WEBHOOK_BASE_URL` должен быть вашим публичным HTTPS-адресом из Cloudflare. Итоговый webhook Telegram будет:
-
-```text
-https://bot.example.com/telegram/webhook
-```
-
-### Docker Compose с Cloudflare Tunnel
-
-1. В Cloudflare Dashboard создайте Tunnel.
-2. В Public Hostname укажите домен или поддомен.
-3. В Service укажите `http://bot:8080`.
-4. Скопируйте token tunnel в `.env`:
-
-```env
-CLOUDFLARE_TUNNEL_TOKEN=your_cloudflare_tunnel_token
-```
-
-5. Запустите:
-
-```bash
-docker compose --profile cloudflare up --build
-```
-
-Для обычного запуска без Cloudflare:
-
-```bash
-docker compose up --build
-```
-
-## Настройка ALLOWED_USERS
-
-В `.env` укажите Telegram user_id пользователей через запятую:
-
-```env
-ALLOWED_USERS=111111111,222222222
-```
-
-Если список пустой, бот не ограничивает доступ. Для закрытого рабочего бота список лучше всегда заполнять.
-
-## Команды
-
-- `/start` - старт
-- `/help` - помощь
+- `/start` или `/help` - помощь
 - `/project_set [name]` - выбрать активный проект для чата
 - `/projects` - список проектов
 - `/idea [text]` - сохранить идею
@@ -140,10 +23,100 @@ ALLOWED_USERS=111111111,222222222
 - `/link [url] [description]` - сохранить ссылку
 - `/find [query]` - поиск по текущему проекту
 
-Команды `/idea`, `/task`, `/note`, `/decision` и `/link` поддерживают reply-режим: если команда отправлена ответом на сообщение без текста после команды, бот возьмёт текст или caption из исходного сообщения.
+Команды `/idea`, `/task`, `/note`, `/decision` и `/link` поддерживают reply-режим.
 
-## Тесты
+## Что нужно создать в Cloudflare
+
+1. Добавьте домен в Cloudflare и дождитесь активного статуса зоны.
+2. Создайте D1 database:
 
 ```bash
-pytest
+npx wrangler d1 create plat_telegram
 ```
+
+3. Скопируйте `database_id` из вывода команды в `wrangler.toml`:
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "plat_telegram"
+database_id = "..."
+```
+
+4. В `wrangler.toml` замените route на ваш домен:
+
+```toml
+routes = [
+  { pattern = "bot.example.com", custom_domain = true }
+]
+```
+
+Итоговый Telegram webhook URL будет:
+
+```text
+https://bot.example.com/telegram/webhook
+```
+
+## GitHub Secrets
+
+В репозитории GitHub откройте:
+
+```text
+Settings -> Secrets and variables -> Actions -> New repository secret
+```
+
+Добавьте:
+
+- `CLOUDFLARE_API_TOKEN` - token Cloudflare с правами на Workers Scripts, Workers Routes и D1.
+- `CLOUDFLARE_ACCOUNT_ID` - Account ID из Cloudflare.
+- `BOT_TOKEN` - token Telegram-бота.
+- `ALLOWED_USERS` - Telegram user_id через запятую, например `111111111,222222222`.
+- `WEBHOOK_SECRET` - произвольная секретная строка для проверки Telegram webhook.
+- `WEBHOOK_URL` - полный URL webhook, например `https://bot.example.com/telegram/webhook`.
+
+Workflow сам загрузит `BOT_TOKEN`, `WEBHOOK_SECRET` и `ALLOWED_USERS` в Worker secrets через Wrangler.
+
+## Деплой через GitHub
+
+После настройки `wrangler.toml` и GitHub Secrets просто отправьте изменения в `main`.
+
+Workflow `.github/workflows/deploy-worker.yml` выполнит:
+
+1. `npm ci`
+2. `npm test`
+3. `wrangler d1 migrations apply plat_telegram --remote`
+4. `wrangler deploy`
+5. `wrangler secret put ...`
+6. `node scripts/set-webhook.mjs`
+
+## Локальная разработка
+
+```bash
+npm install
+npm test
+npm run dev
+```
+
+Для локального D1:
+
+```bash
+npm run db:migrate:local
+```
+
+## Проверка
+
+Healthcheck:
+
+```text
+https://bot.example.com/health
+```
+
+Webhook endpoint:
+
+```text
+https://bot.example.com/telegram/webhook
+```
+
+## Legacy Python
+
+Папка `app/` оставлена как предыдущая Python-реализация. Production-путь теперь находится в `src/worker.js` и деплоится через Wrangler.
