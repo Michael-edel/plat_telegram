@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { hashPassword, verifyPassword } from "../src/auth.js";
 import { commandPayload, extractHashtags, isTaskStatus, isValidUrl, parseAllowedUsers } from "../src/utils.js";
 
 test("extractHashtags returns unique lower-case tags", () => {
@@ -34,4 +35,11 @@ test("isTaskStatus accepts only known task states", () => {
   assert.equal(isTaskStatus("review"), true);
   assert.equal(isTaskStatus("done"), true);
   assert.equal(isTaskStatus("blocked"), false);
+});
+
+test("password hashes verify only matching passwords", async () => {
+  const hash = await hashPassword("correct horse battery staple");
+  assert.equal(hash.startsWith("pbkdf2:sha256:"), true);
+  assert.equal(await verifyPassword("correct horse battery staple", hash), true);
+  assert.equal(await verifyPassword("wrong password", hash), false);
 });

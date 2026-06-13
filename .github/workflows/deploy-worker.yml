@@ -41,16 +41,18 @@ jobs:
           printf "%s" "$BOT_TOKEN" | npx wrangler secret put BOT_TOKEN
           printf "%s" "$WEBHOOK_SECRET" | npx wrangler secret put WEBHOOK_SECRET
           printf "%s" "$ALLOWED_USERS" | npx wrangler secret put ALLOWED_USERS
-          printf "%s" "$PANEL_USERNAME" | npx wrangler secret put PANEL_USERNAME
-          printf "%s" "$PANEL_PASSWORD" | npx wrangler secret put PANEL_PASSWORD
+          printf "%s" "$SESSION_SECRET" | npx wrangler secret put SESSION_SECRET
+          printf "%s" "$INITIAL_ADMIN_USERNAME" | npx wrangler secret put INITIAL_ADMIN_USERNAME
+          printf "%s" "$INITIAL_ADMIN_PASSWORD" | npx wrangler secret put INITIAL_ADMIN_PASSWORD
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
           ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
-          PANEL_USERNAME: ${{ secrets.PANEL_USERNAME }}
-          PANEL_PASSWORD: ${{ secrets.PANEL_PASSWORD }}
+          SESSION_SECRET: ${{ secrets.SESSION_SECRET || secrets.WEBHOOK_SECRET }}
+          INITIAL_ADMIN_USERNAME: ${{ secrets.INITIAL_ADMIN_USERNAME || secrets.PANEL_USERNAME }}
+          INITIAL_ADMIN_PASSWORD: ${{ secrets.INITIAL_ADMIN_PASSWORD || secrets.PANEL_PASSWORD }}
 
       - name: Configure Telegram webhook
         run: node scripts/set-webhook.mjs

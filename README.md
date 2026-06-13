@@ -5,7 +5,7 @@
 ## Архитектура
 
 - Cloudflare Worker принимает Telegram webhook на `/telegram/webhook`.
-- Веб-панель доступна на `/app` и работает с той же D1 базой.
+- Веб-панель доступна на `/app`, работает с той же D1 базой и защищена cookie-session авторизацией.
 - JSON API веб-панели доступен на `/api/*`.
 - Cloudflare D1 хранит проекты, активный проект чата, идеи, задачи, ссылки, заметки, решения и теги.
 - Wrangler деплоит Worker и применяет D1 migrations.
@@ -27,15 +27,27 @@
 
 Команды `/idea`, `/task`, `/note`, `/decision` и `/link` поддерживают reply-режим.
 
-## Веб-панель
+## Веб-панель и роли
 
-Панель предназначена для внутренней работы двух партнёров и закрыта Basic Auth.
+Панель предназначена для внутренней работы двух партнёров и закрыта логином/паролем.
 
 Адрес:
 
 ```text
 https://bot.michael.kz/app
 ```
+
+Страница входа:
+
+```text
+https://bot.michael.kz/login
+```
+
+Роли:
+
+- `admin` - полный доступ, пользователи, аудит, создание проектов и все рабочие действия.
+- `editor` - просмотр, создание и редактирование рабочих записей, смена статуса задач.
+- `viewer` - только просмотр и поиск.
 
 Возможности MVP:
 
@@ -48,6 +60,8 @@ https://bot.michael.kz/app
 - создание задач, идей, заметок, решений и ссылок;
 - просмотр ссылок с открытием в новой вкладке;
 - поиск по текущему проекту;
+- управление пользователями для `admin`;
+- аудит действий для `admin`;
 - JSON API для проектов, данных проекта и поиска.
 
 Маршруты:
@@ -56,25 +70,55 @@ https://bot.michael.kz/app
 GET  /app
 GET  /app/projects
 GET  /app/projects/:id
+GET  /app/users
+GET  /app/audit
 POST /app/projects
 POST /app/tasks
 POST /app/tasks/:id/status
+POST /app/tasks/:id/edit
+POST /app/tasks/:id/delete
 POST /app/ideas
+POST /app/ideas/:id/edit
+POST /app/ideas/:id/delete
 POST /app/notes
+POST /app/notes/:id/edit
+POST /app/notes/:id/delete
 POST /app/decisions
+POST /app/decisions/:id/edit
+POST /app/decisions/:id/delete
 POST /app/links
+POST /app/links/:id/edit
+POST /app/links/:id/delete
 
 GET  /api/projects
 GET  /api/projects/:id
 GET  /api/search?project_id=1&q=...
+GET  /api/admin/users
+GET  /api/admin/audit
+POST /api/admin/users
+POST /api/admin/users/:id/role
+POST /api/admin/users/:id/status
+POST /api/admin/users/:id/password
 ```
 
-Basic Auth задаётся через Worker secrets:
+Безопасность:
+
+- пароли хранятся только как PBKDF2-SHA256 hash;
+- web session хранится в signed HttpOnly cookie;
+- POST-формы защищены CSRF token;
+- write routes проверяют роли на backend;
+- viewer не видит кнопки создания, редактирования, удаления и смены статуса;
+- действия записываются в `audit_log`.
+
+Первый admin создаётся автоматически при первом обращении к панели, если таблица `users` пустая и заданы secrets:
 
 ```text
-PANEL_USERNAME
-PANEL_PASSWORD
+INITIAL_ADMIN_USERNAME
+INITIAL_ADMIN_PASSWORD
+SESSION_SECRET
 ```
+
+`SESSION_SECRET` должен быть длинной случайной строкой.
 
 ## Cloudflare
 
@@ -124,10 +168,11 @@ Settings -> Secrets and variables -> Actions -> New repository secret
 - `ALLOWED_USERS` - Telegram user_id через запятую, например `111111111,222222222`.
 - `WEBHOOK_SECRET` - произвольная секретная строка для проверки Telegram webhook.
 - `WEBHOOK_URL` - полный URL webhook: `https://bot.michael.kz/telegram/webhook`.
-- `PANEL_USERNAME` - логин для веб-панели.
-- `PANEL_PASSWORD` - пароль для веб-панели.
+- `SESSION_SECRET` - длинный секрет для подписи web sessions и CSRF.
+- `INITIAL_ADMIN_USERNAME` - логин первого admin, если `users` ещё пустая.
+- `INITIAL_ADMIN_PASSWORD` - пароль первого admin, если `users` ещё пустая.
 
-Workflow сам загрузит `BOT_TOKEN`, `WEBHOOK_SECRET`, `ALLOWED_USERS`, `PANEL_USERNAME` и `PANEL_PASSWORD` в Worker secrets через Wrangler.
+Workflow сам загрузит `BOT_TOKEN`, `WEBHOOK_SECRET`, `ALLOWED_USERS`, `SESSION_SECRET`, `INITIAL_ADMIN_USERNAME` и `INITIAL_ADMIN_PASSWORD` в Worker secrets через Wrangler.
 
 ## Деплой через GitHub
 

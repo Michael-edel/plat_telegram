@@ -1,16 +1,45 @@
-import { TASK_STATUSES, extractHashtags, isTaskStatus, isValidUrl } from "./utils.js";
+import {
+  WRITE_ROLES,
+  appendSetCookie,
+  clearSessionCookie,
+  createCsrfCookie,
+  createCsrfToken,
+  createSessionCookie,
+  getCurrentUser,
+  hashPassword,
+  requireRole,
+  roleLabel,
+  verifyCsrfToken,
+  verifyPassword,
+} from "./auth.js";
+import {
+  ENTITY_CONFIG,
+  auditLog,
+  createLink,
+  createTask,
+  createTextEntity,
+  getOrCreateProject,
+  getProject,
+  getUser,
+  listAudit,
+  listProjects,
+  listUsers,
+  loadProjectData,
+  searchProject,
+  softDeleteLink,
+  softDeleteTask,
+  softDeleteTextEntity,
+  updateLink,
+  updateTaskStatus,
+  updateTaskText,
+  updateTextEntity,
+} from "./repository.js";
+import { isTaskStatus, isValidUrl } from "./utils.js";
 
-const ENTITY_CONFIG = {
-  ideas: { table: "ideas", entityType: "idea", label: "Идеи", single: "Идея" },
-  notes: { table: "notes", entityType: "note", label: "Заметки", single: "Заметка" },
-  decisions: { table: "decisions", entityType: "decision", label: "Решения", single: "Решение" },
-};
-
-const STATUS_LABELS = {
-  todo: "todo",
-  doing: "doing",
-  review: "review",
-  done: "done",
+const ENTITY_PATHS = {
+  ideas: ENTITY_CONFIG.ideas,
+  notes: ENTITY_CONFIG.notes,
+  decisions: ENTITY_CONFIG.decisions,
 };
 
 function html(body, init = {}) {
@@ -33,52 +62,9 @@ function json(data, init = {}) {
   });
 }
 
-function redirect(location, status = 303) {
-  return new Response(null, { status, headers: { location } });
-}
-
-function unauthorized() {
-  return new Response("Authentication required", {
-    status: 401,
-    headers: { "www-authenticate": 'Basic realm="Project dashboard", charset="UTF-8"' },
-  });
-}
-
-function forbidden(message) {
-  return html(renderLayout({ title: "Ошибка", content: `<section class="panel"><h1>Ошибка</h1><p>${escapeHtml(message)}</p></section>` }), {
-    status: 400,
-  });
-}
-
-function decodeBasicCredentials(header) {
-  if (!header || !header.startsWith("Basic ")) {
-    return null;
-  }
-
-  try {
-    const decoded = atob(header.slice(6));
-    const separator = decoded.indexOf(":");
-    if (separator === -1) {
-      return null;
-    }
-    return {
-      username: decoded.slice(0, separator),
-      password: decoded.slice(separator + 1),
-    };
-  } catch {
-    return null;
-  }
-}
-
-function isAuthorized(request, env) {
-  const username = env.PANEL_USERNAME;
-  const password = env.PANEL_PASSWORD;
-  if (!username || !password) {
-    return false;
-  }
-
-  const credentials = decodeBasicCredentials(request.headers.get("authorization"));
-  return credentials?.username === username && credentials?.password === password;
+function redirect(location, headers = new Headers()) {
+  headers.set("location", location);
+  return new Response(null, { status: 303, headers });
 }
 
 function escapeHtml(value) {
@@ -91,17 +77,36 @@ function escapeHtml(value) {
 }
 
 function formatDate(value) {
-  if (!value) {
-    return "";
-  }
-  return value.replace("T", " ").replace(/\.\d+Z$/, "");
+  return value ? String(value).replace("T", " ").replace(/\.\d+Z$/, "") : "—";
 }
 
-function currentPath(url) {
-  return `${url.pathname}${url.search}`;
+function roleBadge(user) {
+  return `<span class="badge role-${escapeHtml(user.role)}">${escapeHtml(roleLabel(user.role))}</span>`;
 }
 
-function renderLayout({ title, content }) {
+function canWrite(user) {
+  return requireRole(user, WRITE_ROLES);
+}
+
+function isAdmin(user) {
+  return requireRole(user, ["admin"]);
+}
+
+function forbiddenResponse(isApi) {
+  return isApi ? json({ error: "Forbidden" }, { status: 403 }) : renderErrorPage("Недостаточно прав", 403);
+}
+
+async function renderPage(env, user, { title, content }) {
+  const csrfToken = await createCsrfToken(env);
+  const headers = new Headers();
+  appendSetCookie(headers, createCsrfCookie(csrfToken));
+  return html(renderLayout({ title, content, user, csrfToken }), { headers });
+}
+
+function renderLayout({ title, content, user, csrfToken }) {
+  const adminLinks = isAdmin(user)
+    ? `<a href="/app/users">Пользователи</a><a href="/app/audit">Аудит</a>`
+    : "";
   return `<!doctype html>
 <html lang="ru">
 <head>
@@ -110,7 +115,6 @@ function renderLayout({ title, content }) {
   <title>${escapeHtml(title)} · Project Panel</title>
   <style>
     :root {
-      color-scheme: light;
       --bg: #f5f7fb;
       --surface: #ffffff;
       --surface-soft: #eef2f7;
@@ -123,116 +127,49 @@ function renderLayout({ title, content }) {
       --ok: #067647;
       --shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
     }
-
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      min-width: 320px;
       background: var(--bg);
       color: var(--text);
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       font-size: 15px;
       line-height: 1.45;
     }
-
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
-
-    .shell {
-      min-height: 100vh;
-      display: grid;
-      grid-template-columns: 248px 1fr;
-    }
-
-    .sidebar {
-      background: #111827;
-      color: #f9fafb;
-      padding: 22px 18px;
-    }
-
-    .brand {
-      font-size: 18px;
-      font-weight: 700;
-      margin-bottom: 22px;
-    }
-
-    .nav {
-      display: grid;
-      gap: 6px;
-    }
-
-    .nav a {
+    .shell { min-height: 100vh; display: grid; grid-template-columns: 248px 1fr; }
+    .sidebar { background: #111827; color: #f9fafb; padding: 22px 18px; }
+    .brand { font-size: 18px; font-weight: 700; margin-bottom: 18px; }
+    .user-box { border: 1px solid rgba(255,255,255,.12); border-radius: 8px; padding: 10px; margin-bottom: 18px; color: #d1d5db; }
+    .nav { display: grid; gap: 6px; }
+    .nav a, .logout-button {
       color: #d1d5db;
       padding: 9px 10px;
       border-radius: 8px;
+      background: transparent;
+      border: 0;
+      text-align: left;
+      font: inherit;
+      cursor: pointer;
     }
-
-    .nav a:hover {
-      background: rgba(255, 255, 255, 0.08);
-      color: #ffffff;
-      text-decoration: none;
-    }
-
-    .main {
-      padding: 28px;
-      overflow: auto;
-    }
-
-    .topbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      margin-bottom: 24px;
-    }
-
-    h1, h2, h3 {
-      margin: 0;
-      line-height: 1.2;
-      letter-spacing: 0;
-    }
-
+    .nav a:hover, .logout-button:hover { background: rgba(255,255,255,.08); color: #fff; text-decoration: none; }
+    .main { padding: 28px; overflow: auto; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
+    h1, h2, h3 { margin: 0; line-height: 1.2; letter-spacing: 0; }
     h1 { font-size: 26px; }
     h2 { font-size: 18px; margin-bottom: 14px; }
     h3 { font-size: 15px; margin-bottom: 10px; }
-
     .muted { color: var(--muted); }
-
-    .grid {
-      display: grid;
-      gap: 16px;
-    }
-
-    .grid.two {
-      grid-template-columns: minmax(0, 1fr) minmax(320px, 420px);
-      align-items: start;
-    }
-
-    .stats {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(120px, 1fr));
-      gap: 12px;
-      margin-bottom: 18px;
-    }
-
-    .stat, .panel, .card, .task {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      box-shadow: var(--shadow);
-    }
-
+    .grid { display: grid; gap: 16px; }
+    .grid.two { grid-template-columns: minmax(0, 1fr) minmax(320px, 420px); align-items: start; }
+    .stats { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .stat, .panel, .card, .task { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow); }
     .stat { padding: 14px; }
     .stat strong { display: block; font-size: 24px; }
     .stat span { color: var(--muted); }
-
     .panel { padding: 18px; }
-
-    .project-list {
-      display: grid;
-      gap: 10px;
-    }
-
+    .project-list, .items, .forms { display: grid; gap: 10px; }
     .project-row {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
@@ -243,54 +180,12 @@ function renderLayout({ title, content }) {
       border-radius: 8px;
       background: var(--surface);
     }
-
-    .columns {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(180px, 1fr));
-      gap: 12px;
-    }
-
-    .column {
-      min-width: 0;
-      background: var(--surface-soft);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 12px;
-    }
-
-    .task {
-      padding: 12px;
-      margin-bottom: 10px;
-    }
-
-    .task-footer {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      margin-top: 10px;
-    }
-
-    .items {
-      display: grid;
-      gap: 10px;
-    }
-
-    .card {
-      padding: 12px;
-      overflow-wrap: anywhere;
-    }
-
-    .forms {
-      display: grid;
-      gap: 14px;
-    }
-
-    form.compact {
-      display: grid;
-      gap: 8px;
-    }
-
+    .columns { display: grid; grid-template-columns: repeat(4, minmax(180px, 1fr)); gap: 12px; }
+    .column { min-width: 0; background: var(--surface-soft); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+    .task, .card { padding: 12px; overflow-wrap: anywhere; }
+    .task { margin-bottom: 10px; }
+    .task-footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+    form.compact { display: grid; gap: 8px; }
     input, textarea, select {
       width: 100%;
       min-height: 40px;
@@ -301,12 +196,7 @@ function renderLayout({ title, content }) {
       padding: 9px 10px;
       font: inherit;
     }
-
-    textarea {
-      min-height: 84px;
-      resize: vertical;
-    }
-
+    textarea { min-height: 84px; resize: vertical; }
     button, .button {
       min-height: 38px;
       display: inline-flex;
@@ -323,41 +213,21 @@ function renderLayout({ title, content }) {
       text-decoration: none;
       white-space: nowrap;
     }
-
-    button:hover, .button:hover {
-      background: var(--accent-dark);
-      text-decoration: none;
-    }
-
-    .button.secondary, button.secondary {
-      background: #ffffff;
-      border-color: var(--border);
-      color: var(--text);
-    }
-
-    .inline-form {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-    }
-
+    button:hover, .button:hover { background: var(--accent-dark); text-decoration: none; }
+    .button.secondary, button.secondary { background: #ffffff; border-color: var(--border); color: var(--text); }
+    .button.danger, button.danger { background: #fff; border-color: #f3b3ad; color: var(--danger); }
+    .inline-form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .inline-form select { min-width: 105px; }
-
-    .search {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 8px;
-    }
-
-    .section-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 16px;
-    }
-
+    .search { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+    .section-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .badge { display: inline-flex; align-items: center; border-radius: 999px; padding: 2px 8px; font-size: 12px; background: #e5e7eb; color: #111827; }
+    .role-admin { background: #fee4e2; color: #912018; }
+    .role-editor { background: #dbeafe; color: #1e3a8a; }
+    .role-viewer { background: #dcfce7; color: #14532d; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
     @media (max-width: 1100px) {
       .shell { grid-template-columns: 1fr; }
-      .sidebar { position: static; }
       .grid.two, .section-grid, .columns, .stats { grid-template-columns: 1fr; }
       .main { padding: 18px; }
       .topbar { align-items: flex-start; flex-direction: column; }
@@ -368,6 +238,10 @@ function renderLayout({ title, content }) {
   <div class="shell">
     <aside class="sidebar">
       <div class="brand">Project Panel</div>
+      <div class="user-box">
+        <div>${escapeHtml(user.display_name || user.username)}</div>
+        <div>${roleBadge(user)}</div>
+      </div>
       <nav class="nav" aria-label="Основная навигация">
         <a href="/app">Проекты</a>
         <a href="/app#tasks">Задачи</a>
@@ -376,6 +250,11 @@ function renderLayout({ title, content }) {
         <a href="/app#decisions">Решения</a>
         <a href="/app#links">Ссылки</a>
         <a href="/app#search">Поиск</a>
+        ${adminLinks}
+        <form method="post" action="/logout">
+          <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+          <button class="logout-button" type="submit">Выйти</button>
+        </form>
       </nav>
     </aside>
     <main class="main">${content}</main>
@@ -384,125 +263,68 @@ function renderLayout({ title, content }) {
 </html>`;
 }
 
-async function saveTags(db, entityType, entityId, text) {
-  const tags = extractHashtags(text);
-  for (const tag of tags) {
-    const row = await db.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?) RETURNING id").bind(tag).first();
-    const tagRow = row || (await db.prepare("SELECT id FROM tags WHERE name = ?").bind(tag).first());
-    await db
-      .prepare("INSERT OR IGNORE INTO entity_tags (entity_type, entity_id, tag_id) VALUES (?, ?, ?)")
-      .bind(entityType, entityId, tagRow.id)
-      .run();
+async function renderLogin(env, error = "") {
+  const csrfToken = await createCsrfToken(env);
+  const headers = new Headers();
+  appendSetCookie(headers, createCsrfCookie(csrfToken));
+  return html(`<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Вход · Project Panel</title>
+  <style>
+    body { margin:0; min-height:100vh; display:grid; place-items:center; background:#f5f7fb; color:#172033; font-family:Inter, ui-sans-serif, system-ui, "Segoe UI", sans-serif; }
+    .box { width:min(420px, calc(100vw - 32px)); background:#fff; border:1px solid #d9e0ea; border-radius:8px; padding:24px; box-shadow:0 1px 2px rgba(15,23,42,.08); }
+    h1 { margin:0 0 8px; font-size:24px; }
+    p { margin:0 0 18px; color:#687386; }
+    form { display:grid; gap:12px; }
+    input { min-height:42px; border:1px solid #d9e0ea; border-radius:7px; padding:9px 10px; font:inherit; }
+    button { min-height:42px; border:0; border-radius:7px; background:#2563eb; color:white; font:inherit; font-weight:600; cursor:pointer; }
+    .error { color:#b42318; margin-bottom:12px; }
+  </style>
+</head>
+<body>
+  <section class="box">
+    <h1>Вход</h1>
+    <p>Внутренняя проектная панель.</p>
+    ${error ? `<div class="error">${escapeHtml(error)}</div>` : ""}
+    <form method="post" action="/login">
+      <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+      <input name="username" placeholder="Логин" autocomplete="username" required>
+      <input name="password" type="password" placeholder="Пароль" autocomplete="current-password" required>
+      <button type="submit">Войти</button>
+    </form>
+  </section>
+</body>
+</html>`, { headers });
+}
+
+function renderErrorPage(message, status = 400) {
+  return html(`<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Ошибка</title></head><body><h1>${escapeHtml(message)}</h1><p><a href="/app">Вернуться</a></p></body></html>`, { status });
+}
+
+async function readRequestData(request) {
+  const type = request.headers.get("content-type") || "";
+  if (type.includes("application/json")) {
+    return await request.json();
+  }
+  const form = await request.formData();
+  return Object.fromEntries(form.entries());
+}
+
+async function requireCsrf(request, env, data) {
+  const token = data.csrf_token || request.headers.get("x-csrf-token");
+  if (!(await verifyCsrfToken(request, env, token))) {
+    throw new Error("CSRF validation failed");
   }
 }
 
-async function createTextEntity(db, table, entityType, projectId, text) {
-  const cleanText = text.trim();
-  if (!cleanText) {
-    throw new Error("Текст не может быть пустым");
-  }
-  const row = await db
-    .prepare(`INSERT INTO ${table} (project_id, text, created_at) VALUES (?, ?, datetime('now')) RETURNING *`)
-    .bind(projectId, cleanText)
-    .first();
-  await saveTags(db, entityType, row.id, cleanText);
-  return row;
+function projectRedirect(projectId) {
+  return `/app/projects/${encodeURIComponent(projectId)}`;
 }
 
-async function listProjects(db) {
-  const { results } = await db
-    .prepare(
-      `SELECT
-        p.id,
-        p.name,
-        p.created_at,
-        SUM(CASE WHEN t.status = 'todo' THEN 1 ELSE 0 END) AS todo_count,
-        SUM(CASE WHEN t.status = 'doing' THEN 1 ELSE 0 END) AS doing_count,
-        SUM(CASE WHEN t.status = 'review' THEN 1 ELSE 0 END) AS review_count,
-        SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END) AS done_count,
-        (SELECT COUNT(*) FROM ideas WHERE project_id = p.id) AS ideas_count,
-        (SELECT COUNT(*) FROM notes WHERE project_id = p.id) AS notes_count,
-        (SELECT COUNT(*) FROM decisions WHERE project_id = p.id) AS decisions_count,
-        (SELECT COUNT(*) FROM links WHERE project_id = p.id) AS links_count
-      FROM projects p
-      LEFT JOIN tasks t ON t.project_id = p.id
-      GROUP BY p.id
-      ORDER BY p.name`,
-    )
-    .all();
-  return results;
-}
-
-async function getProject(db, projectId) {
-  return await db.prepare("SELECT * FROM projects WHERE id = ?").bind(projectId).first();
-}
-
-async function createProject(db, name) {
-  const cleanName = name.trim();
-  if (!cleanName) {
-    throw new Error("Название проекта не может быть пустым");
-  }
-  const existing = await db.prepare("SELECT * FROM projects WHERE name = ?").bind(cleanName).first();
-  if (existing) {
-    return existing;
-  }
-  return await db
-    .prepare("INSERT INTO projects (name, created_at) VALUES (?, datetime('now')) RETURNING *")
-    .bind(cleanName)
-    .first();
-}
-
-async function loadProjectData(db, projectId) {
-  const [tasks, ideas, notes, decisions, links] = await Promise.all([
-    db.prepare("SELECT id, text, status, created_at FROM tasks WHERE project_id = ? ORDER BY created_at DESC").bind(projectId).all(),
-    db.prepare("SELECT id, text, created_at FROM ideas WHERE project_id = ? ORDER BY created_at DESC LIMIT 100").bind(projectId).all(),
-    db.prepare("SELECT id, text, created_at FROM notes WHERE project_id = ? ORDER BY created_at DESC LIMIT 100").bind(projectId).all(),
-    db.prepare("SELECT id, text, created_at FROM decisions WHERE project_id = ? ORDER BY created_at DESC LIMIT 100").bind(projectId).all(),
-    db
-      .prepare("SELECT id, url, description, created_at FROM links WHERE project_id = ? ORDER BY created_at DESC LIMIT 100")
-      .bind(projectId)
-      .all(),
-  ]);
-
-  return {
-    tasks: tasks.results,
-    ideas: ideas.results,
-    notes: notes.results,
-    decisions: decisions.results,
-    links: links.results,
-  };
-}
-
-async function searchProject(db, projectId, query) {
-  const cleanQuery = query.trim();
-  if (!cleanQuery) {
-    return [];
-  }
-
-  const like = `%${cleanQuery}%`;
-  const [ideas, tasks, links, notes, decisions] = await Promise.all([
-    db.prepare("SELECT id, text FROM ideas WHERE project_id = ? AND text LIKE ? LIMIT 10").bind(projectId, like).all(),
-    db.prepare("SELECT id, text FROM tasks WHERE project_id = ? AND text LIKE ? LIMIT 10").bind(projectId, like).all(),
-    db
-      .prepare(
-        "SELECT id, COALESCE(url, '') || ' ' || COALESCE(description, '') AS text FROM links WHERE project_id = ? AND (COALESCE(url, '') || ' ' || COALESCE(description, '')) LIKE ? LIMIT 10",
-      )
-      .bind(projectId, like)
-      .all(),
-    db.prepare("SELECT id, text FROM notes WHERE project_id = ? AND text LIKE ? LIMIT 10").bind(projectId, like).all(),
-    db.prepare("SELECT id, text FROM decisions WHERE project_id = ? AND text LIKE ? LIMIT 10").bind(projectId, like).all(),
-  ]);
-
-  return [
-    ...ideas.results.map((row) => ({ kind: "Идея", ...row })),
-    ...tasks.results.map((row) => ({ kind: "Задача", ...row })),
-    ...links.results.map((row) => ({ kind: "Ссылка", ...row })),
-    ...notes.results.map((row) => ({ kind: "Заметка", ...row })),
-    ...decisions.results.map((row) => ({ kind: "Решение", ...row })),
-  ];
-}
-
-function renderDashboard(projects) {
+function renderDashboard(projects, user, csrfToken) {
   const totals = projects.reduce(
     (acc, project) => {
       acc.todo += Number(project.todo_count || 0);
@@ -533,16 +355,21 @@ function renderDashboard(projects) {
         .join("")
     : `<p class="muted">Проектов пока нет.</p>`;
 
-  return renderLayout({
-    title: "Проекты",
-    content: `<div class="topbar">
-      <div>
-        <h1>Проекты</h1>
-        <p class="muted">Рабочая панель проектной базы.</p>
-      </div>
-    </div>
+  const createPanel = isAdmin(user)
+    ? `<section class="panel">
+        <h2>Создать проект</h2>
+        <form class="compact" method="post" action="/app/projects">
+          <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+          <input name="name" placeholder="Название проекта" required>
+          <button type="submit">Создать</button>
+        </form>
+      </section>`
+    : `<section class="panel"><h2>Создание проекта</h2><p class="muted">Доступно только admin.</p></section>`;
 
-    <section class="stats" aria-label="Статистика">
+  return `<div class="topbar">
+      <div><h1>Проекты</h1><p class="muted">Рабочая панель проектной базы.</p></div>
+    </div>
+    <section class="stats">
       <div class="stat"><strong>${totals.todo}</strong><span>todo</span></div>
       <div class="stat"><strong>${totals.doing}</strong><span>doing</span></div>
       <div class="stat"><strong>${totals.review}</strong><span>review</span></div>
@@ -552,106 +379,133 @@ function renderDashboard(projects) {
       <div class="stat"><strong>${totals.decisions}</strong><span>решений</span></div>
       <div class="stat"><strong>${totals.links}</strong><span>ссылок</span></div>
     </section>
-
     <div class="grid two">
-      <section class="panel">
-        <h2>Список проектов</h2>
-        <div class="project-list">${projectRows}</div>
-      </section>
-      <section class="panel">
-        <h2>Создать проект</h2>
-        <form class="compact" method="post" action="/app/projects">
-          <input name="name" placeholder="Название проекта" required>
-          <button type="submit">Создать</button>
-        </form>
-      </section>
-    </div>`,
-  });
+      <section class="panel"><h2>Список проектов</h2><div class="project-list">${projectRows}</div></section>
+      ${createPanel}
+    </div>`;
 }
 
-function renderTask(task, projectId) {
-  const options = TASK_STATUSES.map(
-    (status) => `<option value="${status}" ${task.status === status ? "selected" : ""}>${STATUS_LABELS[status]}</option>`,
-  ).join("");
-  return `<article class="task">
-    <div>#${task.id} ${escapeHtml(task.text)}</div>
-    <div class="task-footer">
-      <span class="muted">${escapeHtml(formatDate(task.created_at))}</span>
-      <form class="inline-form" method="post" action="/app/tasks/${task.id}/status">
+function entityMeta(item) {
+  return `<div class="muted">Автор: ${escapeHtml(item.author_name || "—")} · Создано: ${escapeHtml(formatDate(item.created_at))} · Обновлено: ${escapeHtml(formatDate(item.updated_at))}</div>`;
+}
+
+function renderTask(task, projectId, user, csrfToken) {
+  const options = ["todo", "doing", "review", "done"]
+    .map((status) => `<option value="${status}" ${task.status === status ? "selected" : ""}>${status}</option>`)
+    .join("");
+  const actions = canWrite(user)
+    ? `<form class="inline-form" method="post" action="/app/tasks/${task.id}/status">
+        <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
         <input type="hidden" name="project_id" value="${projectId}">
         <select name="status">${options}</select>
         <button class="secondary" type="submit">OK</button>
       </form>
-    </div>
+      <form class="compact" method="post" action="/app/tasks/${task.id}/edit">
+        <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+        <input type="hidden" name="project_id" value="${projectId}">
+        <textarea name="text" required>${escapeHtml(task.text)}</textarea>
+        <button class="secondary" type="submit">Сохранить</button>
+      </form>
+      <form method="post" action="/app/tasks/${task.id}/delete">
+        <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+        <input type="hidden" name="project_id" value="${projectId}">
+        <button class="danger" type="submit">Удалить</button>
+      </form>`
+    : "";
+  return `<article class="task">
+    <div>#${task.id} ${escapeHtml(task.text)}</div>
+    ${entityMeta(task)}
+    <div class="task-footer">${actions}</div>
   </article>`;
 }
 
-function renderTextCards(items) {
-  return items.length
-    ? items
-        .map(
-          (item) => `<article class="card">
-            <div>#${item.id} ${escapeHtml(item.text)}</div>
-            <div class="muted">${escapeHtml(formatDate(item.created_at))}</div>
-          </article>`,
-        )
-        .join("")
-    : `<p class="muted">Нет записей.</p>`;
+function renderTextCards(items, path, projectId, user, csrfToken) {
+  if (!items.length) {
+    return `<p class="muted">Нет записей.</p>`;
+  }
+  return items
+    .map((item) => {
+      const actions = canWrite(user)
+        ? `<form class="compact" method="post" action="/app/${path}/${item.id}/edit">
+            <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+            <input type="hidden" name="project_id" value="${projectId}">
+            <textarea name="text" required>${escapeHtml(item.text)}</textarea>
+            <button class="secondary" type="submit">Сохранить</button>
+          </form>
+          <form method="post" action="/app/${path}/${item.id}/delete">
+            <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+            <input type="hidden" name="project_id" value="${projectId}">
+            <button class="danger" type="submit">Удалить</button>
+          </form>`
+        : "";
+      return `<article class="card"><div>#${item.id} ${escapeHtml(item.text)}</div>${entityMeta(item)}${actions}</article>`;
+    })
+    .join("");
 }
 
-function renderLinks(items) {
-  return items.length
-    ? items
-        .map(
-          (item) => `<article class="card">
-            <div><a href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(item.url)}</a></div>
-            <div>${escapeHtml(item.description || "")}</div>
-            <div class="muted">#${item.id} · ${escapeHtml(formatDate(item.created_at))}</div>
-          </article>`,
-        )
-        .join("")
-    : `<p class="muted">Нет ссылок.</p>`;
+function renderLinks(items, projectId, user, csrfToken) {
+  if (!items.length) {
+    return `<p class="muted">Нет ссылок.</p>`;
+  }
+  return items
+    .map((item) => {
+      const actions = canWrite(user)
+        ? `<form class="compact" method="post" action="/app/links/${item.id}/edit">
+            <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+            <input type="hidden" name="project_id" value="${projectId}">
+            <input name="url" value="${escapeHtml(item.url)}" required>
+            <input name="description" value="${escapeHtml(item.description || "")}">
+            <button class="secondary" type="submit">Сохранить</button>
+          </form>
+          <form method="post" action="/app/links/${item.id}/delete">
+            <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+            <input type="hidden" name="project_id" value="${projectId}">
+            <button class="danger" type="submit">Удалить</button>
+          </form>`
+        : "";
+      return `<article class="card">
+        <div><a href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(item.url)}</a></div>
+        <div>${escapeHtml(item.description || "")}</div>
+        ${entityMeta(item)}
+        ${actions}
+      </article>`;
+    })
+    .join("");
 }
 
 function renderSearchResults(results, query) {
-  if (!query) {
-    return "";
-  }
-
-  if (!results.length) {
-    return `<div class="card">Ничего не найдено.</div>`;
-  }
-
+  if (!query) return "";
+  if (!results.length) return `<div class="card">Ничего не найдено.</div>`;
   return `<div class="items">${results
     .map((item) => `<article class="card"><strong>${escapeHtml(item.kind)} #${item.id}</strong><div>${escapeHtml(item.text)}</div></article>`)
     .join("")}</div>`;
 }
 
-function renderCreateForms(projectId) {
+function renderCreateForms(projectId, user, csrfToken) {
+  if (!canWrite(user)) {
+    return `<section class="panel"><h2>Добавить запись</h2><p class="muted">У вашей роли доступ только на чтение.</p></section>`;
+  }
   return `<section class="panel">
     <h2>Добавить запись</h2>
     <div class="forms">
       <form class="compact" method="post" action="/app/tasks">
+        <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
         <input type="hidden" name="project_id" value="${projectId}">
         <textarea name="text" placeholder="Новая задача" required></textarea>
         <button type="submit">Создать задачу</button>
       </form>
-      <form class="compact" method="post" action="/app/ideas">
-        <input type="hidden" name="project_id" value="${projectId}">
-        <textarea name="text" placeholder="Новая идея" required></textarea>
-        <button type="submit">Сохранить идею</button>
-      </form>
-      <form class="compact" method="post" action="/app/notes">
-        <input type="hidden" name="project_id" value="${projectId}">
-        <textarea name="text" placeholder="Новая заметка" required></textarea>
-        <button type="submit">Сохранить заметку</button>
-      </form>
-      <form class="compact" method="post" action="/app/decisions">
-        <input type="hidden" name="project_id" value="${projectId}">
-        <textarea name="text" placeholder="Новое решение" required></textarea>
-        <button type="submit">Зафиксировать решение</button>
-      </form>
+      ${Object.entries(ENTITY_PATHS)
+        .map(
+          ([path, config]) => `<form class="compact" method="post" action="/app/${path}">
+            <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+            <input type="hidden" name="project_id" value="${projectId}">
+            <textarea name="text" placeholder="${escapeHtml(config.single)}" required></textarea>
+            <button type="submit">Сохранить</button>
+          </form>`,
+        )
+        .join("")}
       <form class="compact" method="post" action="/app/links">
+        <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
         <input type="hidden" name="project_id" value="${projectId}">
         <input name="url" placeholder="https://example.com" required>
         <input name="description" placeholder="Описание ссылки">
@@ -661,25 +515,18 @@ function renderCreateForms(projectId) {
   </section>`;
 }
 
-function renderProject(project, data, searchResults, query) {
-  const taskColumns = TASK_STATUSES.map((status) => {
-    const tasks = data.tasks.filter((task) => task.status === status);
-    return `<section class="column">
-      <h3>${STATUS_LABELS[status]}</h3>
-      ${tasks.length ? tasks.map((task) => renderTask(task, project.id)).join("") : `<p class="muted">Нет задач.</p>`}
-    </section>`;
-  }).join("");
+function renderProject(project, data, searchResults, query, user, csrfToken) {
+  const taskColumns = ["todo", "doing", "review", "done"]
+    .map((status) => {
+      const tasks = data.tasks.filter((task) => task.status === status);
+      return `<section class="column"><h3>${status}</h3>${tasks.length ? tasks.map((task) => renderTask(task, project.id, user, csrfToken)).join("") : `<p class="muted">Нет задач.</p>`}</section>`;
+    })
+    .join("");
 
-  return renderLayout({
-    title: project.name,
-    content: `<div class="topbar">
-      <div>
-        <h1>${escapeHtml(project.name)}</h1>
-        <p class="muted">Создан: ${escapeHtml(formatDate(project.created_at))}</p>
-      </div>
+  return `<div class="topbar">
+      <div><h1>${escapeHtml(project.name)}</h1><p class="muted">Создан: ${escapeHtml(formatDate(project.created_at))}</p></div>
       <a class="button secondary" href="/app">Все проекты</a>
     </div>
-
     <section class="panel" id="search">
       <h2>Поиск</h2>
       <form class="search" method="get" action="/app/projects/${project.id}">
@@ -688,119 +535,356 @@ function renderProject(project, data, searchResults, query) {
       </form>
       ${renderSearchResults(searchResults, query)}
     </section>
-
     <div class="grid two" style="margin-top:16px">
       <div class="grid">
-        <section class="panel" id="tasks">
-          <h2>Задачи</h2>
-          <div class="columns">${taskColumns}</div>
-        </section>
-
+        <section class="panel" id="tasks"><h2>Задачи</h2><div class="columns">${taskColumns}</div></section>
         <div class="section-grid">
-          <section class="panel" id="ideas"><h2>Идеи</h2><div class="items">${renderTextCards(data.ideas)}</div></section>
-          <section class="panel" id="notes"><h2>Заметки</h2><div class="items">${renderTextCards(data.notes)}</div></section>
-          <section class="panel" id="decisions"><h2>Решения</h2><div class="items">${renderTextCards(data.decisions)}</div></section>
-          <section class="panel" id="links"><h2>Ссылки</h2><div class="items">${renderLinks(data.links)}</div></section>
+          <section class="panel" id="ideas"><h2>Идеи</h2><div class="items">${renderTextCards(data.ideas, "ideas", project.id, user, csrfToken)}</div></section>
+          <section class="panel" id="notes"><h2>Заметки</h2><div class="items">${renderTextCards(data.notes, "notes", project.id, user, csrfToken)}</div></section>
+          <section class="panel" id="decisions"><h2>Решения</h2><div class="items">${renderTextCards(data.decisions, "decisions", project.id, user, csrfToken)}</div></section>
+          <section class="panel" id="links"><h2>Ссылки</h2><div class="items">${renderLinks(data.links, project.id, user, csrfToken)}</div></section>
         </div>
       </div>
-      ${renderCreateForms(project.id)}
-    </div>`,
-  });
+      ${renderCreateForms(project.id, user, csrfToken)}
+    </div>`;
 }
 
-async function readForm(request) {
-  const form = await request.formData();
-  return Object.fromEntries(form.entries());
+function renderUsersPage(users, csrfToken) {
+  const rows = users
+    .map(
+      (user) => `<tr>
+        <td>${user.id}</td>
+        <td>${escapeHtml(user.username)}<br><span class="muted">${escapeHtml(user.display_name || "")}</span></td>
+        <td>${roleBadge(user)}</td>
+        <td>${escapeHtml(user.telegram_id || "—")}</td>
+        <td>${user.is_active ? "активен" : "отключён"}</td>
+        <td>
+          <form class="inline-form" method="post" action="/app/users/${user.id}/role">
+            <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+            <select name="role">
+              ${["admin", "editor", "viewer"].map((role) => `<option value="${role}" ${user.role === role ? "selected" : ""}>${role}</option>`).join("")}
+            </select>
+            <button class="secondary">Роль</button>
+          </form>
+          <form class="inline-form" method="post" action="/app/users/${user.id}/status">
+            <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+            <input type="hidden" name="is_active" value="${user.is_active ? "0" : "1"}">
+            <button class="secondary">${user.is_active ? "Отключить" : "Включить"}</button>
+          </form>
+          <form class="inline-form" method="post" action="/app/users/${user.id}/password">
+            <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+            <input name="password" type="password" placeholder="Новый пароль" required>
+            <button class="secondary">Пароль</button>
+          </form>
+        </td>
+      </tr>`,
+    )
+    .join("");
+
+  return `<div class="topbar"><h1>Пользователи</h1><a class="button secondary" href="/app">Проекты</a></div>
+    <div class="grid two">
+      <section class="panel">
+        <h2>Список пользователей</h2>
+        <table><thead><tr><th>ID</th><th>Пользователь</th><th>Роль</th><th>Telegram ID</th><th>Статус</th><th>Действия</th></tr></thead><tbody>${rows}</tbody></table>
+      </section>
+      <section class="panel">
+        <h2>Создать пользователя</h2>
+        <form class="compact" method="post" action="/app/users">
+          <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+          <input name="username" placeholder="Логин" required>
+          <input name="display_name" placeholder="Имя">
+          <input name="telegram_id" placeholder="Telegram ID">
+          <select name="role"><option value="viewer">viewer</option><option value="editor">editor</option><option value="admin">admin</option></select>
+          <input name="password" type="password" placeholder="Пароль" required>
+          <button type="submit">Создать</button>
+        </form>
+      </section>
+    </div>`;
 }
 
-function projectRedirect(projectId) {
-  return `/app/projects/${encodeURIComponent(projectId)}`;
+function renderAuditPage(rows) {
+  const body = rows
+    .map(
+      (row) => `<tr>
+        <td>${escapeHtml(formatDate(row.created_at))}</td>
+        <td>${escapeHtml(row.username || "—")}</td>
+        <td>${escapeHtml(row.action)}</td>
+        <td>${escapeHtml(row.entity_type || "—")} ${row.entity_id || ""}</td>
+        <td><code>${escapeHtml(row.details_json || "")}</code></td>
+      </tr>`,
+    )
+    .join("");
+  return `<div class="topbar"><h1>Аудит</h1><a class="button secondary" href="/app">Проекты</a></div>
+    <section class="panel">
+      <table><thead><tr><th>Дата</th><th>Пользователь</th><th>Действие</th><th>Сущность</th><th>Детали</th></tr></thead><tbody>${body}</tbody></table>
+    </section>`;
 }
 
-async function handleDashboard(env) {
-  const projects = await listProjects(env.DB);
-  return html(renderDashboard(projects));
-}
-
-async function handleProjectPage(env, request, projectId) {
-  const project = await getProject(env.DB, projectId);
-  if (!project) {
-    return html(renderLayout({ title: "Проект не найден", content: `<section class="panel"><h1>Проект не найден</h1></section>` }), {
-      status: 404,
-    });
+async function handleLogin(request, env) {
+  const data = await readRequestData(request);
+  if (!(await verifyCsrfToken(request, env, data.csrf_token))) {
+    return await renderLogin(env, "Сессия формы устарела. Повторите вход.");
   }
 
+  const username = String(data.username || "").trim();
+  const password = String(data.password || "");
+  const user = await env.DB
+    .prepare("SELECT id, username, password_hash, role, telegram_id, display_name, is_active FROM users WHERE username = ?")
+    .bind(username)
+    .first();
+
+  if (!user || !user.is_active || !(await verifyPassword(password, user.password_hash))) {
+    await auditLog(env.DB, {
+      action: "login.failure",
+      details: { username, source: "web" },
+    });
+    return await renderLogin(env, "Неверный логин или пароль.");
+  }
+
+  await env.DB.prepare("UPDATE users SET last_login_at = datetime('now'), updated_at = datetime('now') WHERE id = ?").bind(user.id).run();
+  await auditLog(env.DB, { userId: user.id, action: "login.success", details: { source: "web" } });
+  const headers = new Headers();
+  appendSetCookie(headers, await createSessionCookie(env, user));
+  return redirect("/app", headers);
+}
+
+async function handleLogout(request, env, user) {
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  await auditLog(env.DB, { userId: user.id, action: "logout", details: { source: "web" } });
+  const headers = new Headers();
+  clearSessionCookie(headers);
+  return redirect("/login", headers);
+}
+
+async function handleDashboard(env, user) {
+  const projects = await listProjects(env.DB);
+  const csrfToken = await createCsrfToken(env);
+  const headers = new Headers();
+  appendSetCookie(headers, createCsrfCookie(csrfToken));
+  return html(renderLayout({ title: "Проекты", content: renderDashboard(projects, user, csrfToken), user, csrfToken }), { headers });
+}
+
+async function handleProjectPage(env, request, user, projectId) {
+  const project = await getProject(env.DB, projectId);
+  if (!project) return renderErrorPage("Проект не найден", 404);
   const url = new URL(request.url);
   const query = url.searchParams.get("q") || "";
   const [data, searchResults] = await Promise.all([
     loadProjectData(env.DB, project.id),
     query ? searchProject(env.DB, project.id, query) : Promise.resolve([]),
   ]);
-  return html(renderProject(project, data, searchResults, query));
+  const csrfToken = await createCsrfToken(env);
+  const headers = new Headers();
+  appendSetCookie(headers, createCsrfCookie(csrfToken));
+  return html(renderLayout({ title: project.name, content: renderProject(project, data, searchResults, query, user, csrfToken), user, csrfToken }), {
+    headers,
+  });
 }
 
-async function handleCreateProject(env, request) {
-  const form = await readForm(request);
-  const project = await createProject(env.DB, String(form.name || ""));
+async function handleCreateProject(env, request, user) {
+  if (!isAdmin(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const project = await getOrCreateProject(env.DB, String(data.name || ""), user.id, "web");
   return redirect(projectRedirect(project.id));
 }
 
-async function handleCreateTask(env, request) {
-  const form = await readForm(request);
-  const projectId = Number.parseInt(form.project_id, 10);
-  const text = String(form.text || "").trim();
-  if (!projectId || !text) {
-    return forbidden("Укажите проект и текст задачи.");
-  }
-  const task = await env.DB
-    .prepare("INSERT INTO tasks (project_id, text, status, created_at) VALUES (?, ?, 'todo', datetime('now')) RETURNING *")
-    .bind(projectId, text)
+async function handleCreateTask(env, request, user) {
+  if (!canWrite(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const projectId = Number.parseInt(data.project_id, 10);
+  await createTask(env.DB, { projectId, text: String(data.text || ""), authorId: user.id, source: "web" });
+  return redirect(projectRedirect(projectId));
+}
+
+async function handleTaskStatus(env, request, user, taskId) {
+  if (!canWrite(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const projectId = Number.parseInt(data.project_id, 10);
+  await updateTaskStatus(env.DB, { taskId, projectId, status: String(data.status || ""), userId: user.id });
+  return redirect(projectRedirect(projectId));
+}
+
+async function handleTaskEdit(env, request, user, taskId) {
+  if (!canWrite(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const projectId = Number.parseInt(data.project_id, 10);
+  await updateTaskText(env.DB, { taskId, projectId, text: String(data.text || ""), userId: user.id });
+  return redirect(projectRedirect(projectId));
+}
+
+async function handleTaskDelete(env, request, user, taskId) {
+  if (!canWrite(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const projectId = Number.parseInt(data.project_id, 10);
+  await softDeleteTask(env.DB, { taskId, projectId, userId: user.id });
+  return redirect(projectRedirect(projectId));
+}
+
+async function handleCreateEntity(env, request, user, config) {
+  if (!canWrite(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const projectId = Number.parseInt(data.project_id, 10);
+  await createTextEntity(env.DB, {
+    table: config.table,
+    entityType: config.entityType,
+    projectId,
+    text: String(data.text || ""),
+    authorId: user.id,
+    source: "web",
+  });
+  return redirect(projectRedirect(projectId));
+}
+
+async function handleEntityEdit(env, request, user, config, entityId) {
+  if (!canWrite(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const projectId = Number.parseInt(data.project_id, 10);
+  await updateTextEntity(env.DB, {
+    table: config.table,
+    entityType: config.entityType,
+    entityId,
+    projectId,
+    text: String(data.text || ""),
+    userId: user.id,
+  });
+  return redirect(projectRedirect(projectId));
+}
+
+async function handleEntityDelete(env, request, user, config, entityId) {
+  if (!canWrite(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const projectId = Number.parseInt(data.project_id, 10);
+  await softDeleteTextEntity(env.DB, { table: config.table, entityType: config.entityType, entityId, projectId, userId: user.id });
+  return redirect(projectRedirect(projectId));
+}
+
+async function handleCreateLink(env, request, user) {
+  if (!canWrite(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const projectId = Number.parseInt(data.project_id, 10);
+  const url = String(data.url || "");
+  if (!isValidUrl(url)) throw new Error("Некорректная ссылка");
+  await createLink(env.DB, {
+    projectId,
+    url,
+    description: String(data.description || ""),
+    authorId: user.id,
+    source: "web",
+  });
+  return redirect(projectRedirect(projectId));
+}
+
+async function handleLinkEdit(env, request, user, linkId) {
+  if (!canWrite(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const projectId = Number.parseInt(data.project_id, 10);
+  const url = String(data.url || "");
+  if (!isValidUrl(url)) throw new Error("Некорректная ссылка");
+  await updateLink(env.DB, { linkId, projectId, url, description: String(data.description || ""), userId: user.id });
+  return redirect(projectRedirect(projectId));
+}
+
+async function handleLinkDelete(env, request, user, linkId) {
+  if (!canWrite(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const projectId = Number.parseInt(data.project_id, 10);
+  await softDeleteLink(env.DB, { linkId, projectId, userId: user.id });
+  return redirect(projectRedirect(projectId));
+}
+
+async function handleUsersPage(env, user) {
+  if (!isAdmin(user)) return forbiddenResponse(false);
+  const users = await listUsers(env.DB);
+  const csrfToken = await createCsrfToken(env);
+  const headers = new Headers();
+  appendSetCookie(headers, createCsrfCookie(csrfToken));
+  return html(renderLayout({ title: "Пользователи", content: renderUsersPage(users, csrfToken), user, csrfToken }), { headers });
+}
+
+async function handleAuditPage(env, user) {
+  if (!isAdmin(user)) return forbiddenResponse(false);
+  const csrfToken = await createCsrfToken(env);
+  const headers = new Headers();
+  appendSetCookie(headers, createCsrfCookie(csrfToken));
+  return html(renderLayout({ title: "Аудит", content: renderAuditPage(await listAudit(env.DB)), user, csrfToken }), { headers });
+}
+
+async function handleCreateUser(env, request, user) {
+  if (!isAdmin(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const username = String(data.username || "").trim();
+  const password = String(data.password || "");
+  const role = String(data.role || "viewer");
+  if (!username || !password || !["admin", "editor", "viewer"].includes(role)) throw new Error("Некорректные данные пользователя");
+  const passwordHash = await hashPassword(password);
+  const result = await env.DB
+    .prepare(
+      "INSERT INTO users (username, password_hash, role, telegram_id, display_name, is_active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, datetime('now'), datetime('now')) RETURNING id",
+    )
+    .bind(username, passwordHash, role, String(data.telegram_id || "").trim() || null, String(data.display_name || "").trim() || null)
     .first();
-  await saveTags(env.DB, "task", task.id, text);
-  return redirect(projectRedirect(projectId));
+  await auditLog(env.DB, { userId: user.id, action: "user.created", entityType: "user", entityId: result.id, details: { username, role } });
+  return redirect("/app/users");
 }
 
-async function handleTaskStatus(env, request, taskId) {
-  const form = await readForm(request);
-  const projectId = Number.parseInt(form.project_id, 10);
-  const status = String(form.status || "");
-  if (!projectId || !isTaskStatus(status)) {
-    return forbidden("Некорректный статус задачи.");
-  }
-
-  await env.DB.prepare("UPDATE tasks SET status = ? WHERE id = ? AND project_id = ?").bind(status, taskId, projectId).run();
-  return redirect(projectRedirect(projectId));
+async function handleUserRole(env, request, user, targetId) {
+  if (!isAdmin(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const target = await getUser(env.DB, targetId);
+  const role = String(data.role || "");
+  if (!target || !["admin", "editor", "viewer"].includes(role)) throw new Error("Некорректная роль");
+  await env.DB.prepare("UPDATE users SET role = ?, updated_at = datetime('now') WHERE id = ?").bind(role, targetId).run();
+  await auditLog(env.DB, {
+    userId: user.id,
+    action: "user.role_changed",
+    entityType: "user",
+    entityId: targetId,
+    details: { old_role: target.role, new_role: role },
+  });
+  return redirect("/app/users");
 }
 
-async function handleCreateTextEntity(env, request, config) {
-  const form = await readForm(request);
-  const projectId = Number.parseInt(form.project_id, 10);
-  const text = String(form.text || "");
-  if (!projectId || !text.trim()) {
-    return forbidden("Укажите проект и текст.");
-  }
-  await createTextEntity(env.DB, config.table, config.entityType, projectId, text);
-  return redirect(projectRedirect(projectId));
+async function handleUserStatus(env, request, user, targetId) {
+  if (!isAdmin(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const isActive = String(data.is_active) === "1" ? 1 : 0;
+  await env.DB.prepare("UPDATE users SET is_active = ?, updated_at = datetime('now') WHERE id = ?").bind(isActive, targetId).run();
+  await auditLog(env.DB, {
+    userId: user.id,
+    action: isActive ? "user.activated" : "user.deactivated",
+    entityType: "user",
+    entityId: targetId,
+  });
+  return redirect("/app/users");
 }
 
-async function handleCreateLink(env, request) {
-  const form = await readForm(request);
-  const projectId = Number.parseInt(form.project_id, 10);
-  const url = String(form.url || "").trim();
-  const description = String(form.description || "").trim();
-  if (!projectId || !isValidUrl(url)) {
-    return forbidden("Некорректная ссылка. Нужен URL с http или https.");
-  }
-
-  const link = await env.DB
-    .prepare("INSERT INTO links (project_id, url, description, created_at) VALUES (?, ?, ?, datetime('now')) RETURNING *")
-    .bind(projectId, url, description || null)
-    .first();
-  await saveTags(env.DB, "link", link.id, `${url} ${description}`);
-  return redirect(projectRedirect(projectId));
+async function handleUserPassword(env, request, user, targetId) {
+  if (!isAdmin(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const password = String(data.password || "");
+  if (password.length < 8) throw new Error("Пароль должен быть не короче 8 символов");
+  await env.DB.prepare("UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?").bind(await hashPassword(password), targetId).run();
+  await auditLog(env.DB, { userId: user.id, action: "user.password_changed", entityType: "user", entityId: targetId });
+  return redirect("/app/users");
 }
 
-async function handleApi(env, request, url) {
+async function handleApi(env, request, url, user) {
   if (request.method === "GET" && url.pathname === "/api/projects") {
     return json({ projects: await listProjects(env.DB) });
   }
@@ -809,83 +893,259 @@ async function handleApi(env, request, url) {
   if (request.method === "GET" && projectMatch) {
     const projectId = Number.parseInt(projectMatch[1], 10);
     const project = await getProject(env.DB, projectId);
-    if (!project) {
-      return json({ error: "Project not found" }, { status: 404 });
-    }
+    if (!project) return json({ error: "Project not found" }, { status: 404 });
     return json({ project, data: await loadProjectData(env.DB, projectId) });
   }
 
   if (request.method === "GET" && url.pathname === "/api/search") {
     const projectId = Number.parseInt(url.searchParams.get("project_id") || "", 10);
-    const query = url.searchParams.get("q") || "";
-    if (!projectId) {
-      return json({ error: "project_id is required" }, { status: 400 });
+    if (!projectId) return json({ error: "project_id is required" }, { status: 400 });
+    return json({ results: await searchProject(env.DB, projectId, url.searchParams.get("q") || "") });
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/admin/users") {
+    if (!isAdmin(user)) return forbiddenResponse(true);
+    return json({ users: await listUsers(env.DB) });
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/admin/audit") {
+    if (!isAdmin(user)) return forbiddenResponse(true);
+    return json({ audit: await listAudit(env.DB) });
+  }
+
+  if (request.method !== "POST") return json({ error: "Not found" }, { status: 404 });
+  if (!canWrite(user) && !url.pathname.startsWith("/api/admin/")) return forbiddenResponse(true);
+
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+
+  if (url.pathname === "/api/admin/users") {
+    if (!isAdmin(user)) return forbiddenResponse(true);
+    const username = String(data.username || "").trim();
+    const password = String(data.password || "");
+    const role = String(data.role || "viewer");
+    if (!username || !password || !["admin", "editor", "viewer"].includes(role)) {
+      return json({ error: "Invalid user data" }, { status: 400 });
     }
-    return json({ results: await searchProject(env.DB, projectId, query) });
+    const passwordHash = await hashPassword(password);
+    const created = await env.DB
+      .prepare(
+        "INSERT INTO users (username, password_hash, role, telegram_id, display_name, is_active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, datetime('now'), datetime('now')) RETURNING id, username, role",
+      )
+      .bind(username, passwordHash, role, String(data.telegram_id || "").trim() || null, String(data.display_name || "").trim() || null)
+      .first();
+    await auditLog(env.DB, { userId: user.id, action: "user.created", entityType: "user", entityId: created.id, details: { username, role, source: "api" } });
+    return json({ user: created }, { status: 201 });
+  }
+
+  const adminUserAction = url.pathname.match(/^\/api\/admin\/users\/(\d+)\/(role|status|password)$/);
+  if (adminUserAction) {
+    if (!isAdmin(user)) return forbiddenResponse(true);
+    const targetId = Number.parseInt(adminUserAction[1], 10);
+    if (adminUserAction[2] === "role") {
+      const target = await getUser(env.DB, targetId);
+      const role = String(data.role || "");
+      if (!target || !["admin", "editor", "viewer"].includes(role)) return json({ error: "Invalid role" }, { status: 400 });
+      await env.DB.prepare("UPDATE users SET role = ?, updated_at = datetime('now') WHERE id = ?").bind(role, targetId).run();
+      await auditLog(env.DB, {
+        userId: user.id,
+        action: "user.role_changed",
+        entityType: "user",
+        entityId: targetId,
+        details: { old_role: target.role, new_role: role, source: "api" },
+      });
+      return json({ ok: true });
+    }
+    if (adminUserAction[2] === "status") {
+      const isActive = String(data.is_active) === "1" ? 1 : 0;
+      await env.DB.prepare("UPDATE users SET is_active = ?, updated_at = datetime('now') WHERE id = ?").bind(isActive, targetId).run();
+      await auditLog(env.DB, {
+        userId: user.id,
+        action: isActive ? "user.activated" : "user.deactivated",
+        entityType: "user",
+        entityId: targetId,
+        details: { source: "api" },
+      });
+      return json({ ok: true });
+    }
+    const password = String(data.password || "");
+    if (password.length < 8) return json({ error: "Password is too short" }, { status: 400 });
+    await env.DB.prepare("UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?").bind(await hashPassword(password), targetId).run();
+    await auditLog(env.DB, {
+      userId: user.id,
+      action: "user.password_changed",
+      entityType: "user",
+      entityId: targetId,
+      details: { source: "api" },
+    });
+    return json({ ok: true });
+  }
+
+  if (url.pathname === "/api/projects") {
+    if (!isAdmin(user)) return forbiddenResponse(true);
+    const project = await getOrCreateProject(env.DB, String(data.name || ""), user.id, "api");
+    return json({ project }, { status: 201 });
+  }
+
+  if (url.pathname === "/api/tasks") {
+    const task = await createTask(env.DB, {
+      projectId: Number.parseInt(data.project_id, 10),
+      text: String(data.text || ""),
+      authorId: user.id,
+      source: "api",
+    });
+    return json({ task }, { status: 201 });
+  }
+
+  const taskAction = url.pathname.match(/^\/api\/tasks\/(\d+)\/(status|edit|delete)$/);
+  if (taskAction) {
+    const taskId = Number.parseInt(taskAction[1], 10);
+    const projectId = Number.parseInt(data.project_id, 10);
+    if (taskAction[2] === "status") await updateTaskStatus(env.DB, { taskId, projectId, status: String(data.status || ""), userId: user.id });
+    if (taskAction[2] === "edit") await updateTaskText(env.DB, { taskId, projectId, text: String(data.text || ""), userId: user.id });
+    if (taskAction[2] === "delete") await softDeleteTask(env.DB, { taskId, projectId, userId: user.id });
+    return json({ ok: true });
+  }
+
+  for (const [path, config] of Object.entries(ENTITY_PATHS)) {
+    if (url.pathname === `/api/${path}`) {
+      const entity = await createTextEntity(env.DB, {
+        table: config.table,
+        entityType: config.entityType,
+        projectId: Number.parseInt(data.project_id, 10),
+        text: String(data.text || ""),
+        authorId: user.id,
+        source: "api",
+      });
+      return json({ entity }, { status: 201 });
+    }
+
+    const match = url.pathname.match(new RegExp(`^/api/${path}/(\\d+)/(edit|delete)$`));
+    if (match) {
+      const entityId = Number.parseInt(match[1], 10);
+      const projectId = Number.parseInt(data.project_id, 10);
+      if (match[2] === "edit") {
+        await updateTextEntity(env.DB, {
+          table: config.table,
+          entityType: config.entityType,
+          entityId,
+          projectId,
+          text: String(data.text || ""),
+          userId: user.id,
+        });
+      } else {
+        await softDeleteTextEntity(env.DB, { table: config.table, entityType: config.entityType, entityId, projectId, userId: user.id });
+      }
+      return json({ ok: true });
+    }
+  }
+
+  if (url.pathname === "/api/links") {
+    if (!isValidUrl(String(data.url || ""))) return json({ error: "Invalid URL" }, { status: 400 });
+    const link = await createLink(env.DB, {
+      projectId: Number.parseInt(data.project_id, 10),
+      url: String(data.url || ""),
+      description: String(data.description || ""),
+      authorId: user.id,
+      source: "api",
+    });
+    return json({ link }, { status: 201 });
+  }
+
+  const linkAction = url.pathname.match(/^\/api\/links\/(\d+)\/(edit|delete)$/);
+  if (linkAction) {
+    const linkId = Number.parseInt(linkAction[1], 10);
+    const projectId = Number.parseInt(data.project_id, 10);
+    if (linkAction[2] === "edit") {
+      if (!isValidUrl(String(data.url || ""))) return json({ error: "Invalid URL" }, { status: 400 });
+      await updateLink(env.DB, { linkId, projectId, url: String(data.url || ""), description: String(data.description || ""), userId: user.id });
+    } else {
+      await softDeleteLink(env.DB, { linkId, projectId, userId: user.id });
+    }
+    return json({ ok: true });
   }
 
   return json({ error: "Not found" }, { status: 404 });
 }
 
 export async function handleWebRequest(request, env) {
-  if (!isAuthorized(request, env)) {
-    return unauthorized();
-  }
-
   const url = new URL(request.url);
 
   try {
-    if (url.pathname.startsWith("/api/")) {
-      return await handleApi(env, request, url);
+    if (request.method === "GET" && url.pathname === "/login") {
+      const user = await getCurrentUser(request, env);
+      return user ? redirect("/app") : await renderLogin(env);
     }
 
+    if (request.method === "POST" && url.pathname === "/login") {
+      return await handleLogin(request, env);
+    }
+
+    const user = await getCurrentUser(request, env);
+    const wantsApi = url.pathname.startsWith("/api/");
+    if (!user) {
+      return wantsApi ? json({ error: "Unauthorized" }, { status: 401 }) : redirect("/login");
+    }
+
+    if (request.method === "POST" && url.pathname === "/logout") return await handleLogout(request, env, user);
+    if (url.pathname.startsWith("/api/")) return await handleApi(env, request, url, user);
+
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/app" || url.pathname === "/app/projects")) {
-      return await handleDashboard(env);
+      return await handleDashboard(env, user);
     }
 
     const projectMatch = url.pathname.match(/^\/app\/projects\/(\d+)$/);
     if (request.method === "GET" && projectMatch) {
-      return await handleProjectPage(env, request, Number.parseInt(projectMatch[1], 10));
+      return await handleProjectPage(env, request, user, Number.parseInt(projectMatch[1], 10));
     }
 
-    if (request.method === "POST" && url.pathname === "/app/projects") {
-      return await handleCreateProject(env, request);
+    if (request.method === "GET" && url.pathname === "/app/users") return await handleUsersPage(env, user);
+    if (request.method === "GET" && url.pathname === "/app/audit") return await handleAuditPage(env, user);
+
+    if (request.method === "POST" && url.pathname === "/app/projects") return await handleCreateProject(env, request, user);
+    if (request.method === "POST" && url.pathname === "/app/tasks") return await handleCreateTask(env, request, user);
+
+    const taskAction = url.pathname.match(/^\/app\/tasks\/(\d+)\/(status|edit|delete)$/);
+    if (request.method === "POST" && taskAction) {
+      const taskId = Number.parseInt(taskAction[1], 10);
+      if (taskAction[2] === "status") return await handleTaskStatus(env, request, user, taskId);
+      if (taskAction[2] === "edit") return await handleTaskEdit(env, request, user, taskId);
+      return await handleTaskDelete(env, request, user, taskId);
     }
 
-    if (request.method === "POST" && url.pathname === "/app/tasks") {
-      return await handleCreateTask(env, request);
-    }
-
-    const taskStatusMatch = url.pathname.match(/^\/app\/tasks\/(\d+)\/status$/);
-    if (request.method === "POST" && taskStatusMatch) {
-      return await handleTaskStatus(env, request, Number.parseInt(taskStatusMatch[1], 10));
-    }
-
-    for (const [path, config] of Object.entries(ENTITY_CONFIG)) {
-      if (request.method === "POST" && url.pathname === `/app/${path}`) {
-        return await handleCreateTextEntity(env, request, config);
+    for (const [path, config] of Object.entries(ENTITY_PATHS)) {
+      if (request.method === "POST" && url.pathname === `/app/${path}`) return await handleCreateEntity(env, request, user, config);
+      const match = url.pathname.match(new RegExp(`^/app/${path}/(\\d+)/(edit|delete)$`));
+      if (request.method === "POST" && match) {
+        const entityId = Number.parseInt(match[1], 10);
+        if (match[2] === "edit") return await handleEntityEdit(env, request, user, config, entityId);
+        return await handleEntityDelete(env, request, user, config, entityId);
       }
     }
 
-    if (request.method === "POST" && url.pathname === "/app/links") {
-      return await handleCreateLink(env, request);
+    if (request.method === "POST" && url.pathname === "/app/links") return await handleCreateLink(env, request, user);
+    const linkAction = url.pathname.match(/^\/app\/links\/(\d+)\/(edit|delete)$/);
+    if (request.method === "POST" && linkAction) {
+      const linkId = Number.parseInt(linkAction[1], 10);
+      if (linkAction[2] === "edit") return await handleLinkEdit(env, request, user, linkId);
+      return await handleLinkDelete(env, request, user, linkId);
     }
 
-    return html(renderLayout({ title: "Не найдено", content: `<section class="panel"><h1>Страница не найдена</h1></section>` }), {
-      status: 404,
-    });
+    const userAction = url.pathname.match(/^\/app\/users\/(\d+)\/(role|status|password)$/);
+    if (request.method === "POST" && url.pathname === "/app/users") return await handleCreateUser(env, request, user);
+    if (request.method === "POST" && userAction) {
+      const targetId = Number.parseInt(userAction[1], 10);
+      if (userAction[2] === "role") return await handleUserRole(env, request, user, targetId);
+      if (userAction[2] === "status") return await handleUserStatus(env, request, user, targetId);
+      return await handleUserPassword(env, request, user, targetId);
+    }
+
+    return renderErrorPage("Страница не найдена", 404);
   } catch (error) {
     console.error("Web panel error", error);
-    const wantsJson = url.pathname.startsWith("/api/");
-    if (wantsJson) {
-      return json({ error: "Internal server error" }, { status: 500 });
+    if (url.pathname.startsWith("/api/")) {
+      return json({ error: error.message || "Internal server error" }, { status: 500 });
     }
-    return html(
-      renderLayout({
-        title: "Ошибка",
-        content: `<section class="panel"><h1>Ошибка</h1><p>Не удалось выполнить действие. Проверьте данные и повторите.</p><p class="muted">${escapeHtml(error.message)}</p></section>`,
-      }),
-      { status: 500 },
-    );
+    return renderErrorPage(error.message || "Не удалось выполнить действие", 500);
   }
 }

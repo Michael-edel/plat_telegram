@@ -7,6 +7,15 @@ import {
   truncateText,
 } from "./utils.js";
 import { handleWebRequest } from "./web.js";
+import {
+  auditLog,
+  createLink,
+  createTask,
+  createTextEntity as createRepositoryTextEntity,
+  findUserByTelegramId,
+  getOrCreateProject,
+  saveTags,
+} from "./repository.js";
 
 function json(data, init = {}) {
   return new Response(JSON.stringify(data), {
@@ -39,26 +48,8 @@ function isAllowed(env, userId) {
   return allowedUsers.size === 0 || allowedUsers.has(userId);
 }
 
-async function getOrCreateProject(db, name) {
-  const cleanName = name.trim();
-  if (!cleanName) {
-    throw new Error("Название проекта не может быть пустым");
-  }
-
-  const existing = await db.prepare("SELECT * FROM projects WHERE name = ?").bind(cleanName).first();
-  if (existing) {
-    return existing;
-  }
-
-  const result = await db
-    .prepare("INSERT INTO projects (name, created_at) VALUES (?, datetime('now')) RETURNING *")
-    .bind(cleanName)
-    .first();
-  return result;
-}
-
 async function setActiveProject(db, chatId, name) {
-  const project = await getOrCreateProject(db, name);
+  const project = await getOrCreateProject(db, name, null, "telegram");
   await db
     .prepare(
       "INSERT INTO chat_projects (chat_id, project_id) VALUES (?, ?) " +
@@ -89,35 +80,20 @@ async function requireActiveProject(env, message) {
   return project;
 }
 
-async function saveTags(db, entityType, entityId, text) {
-  const tags = extractHashtags(text);
-  for (const tag of tags) {
-    const row = await db
-      .prepare("INSERT OR IGNORE INTO tags (name) VALUES (?) RETURNING id")
-      .bind(tag)
-      .first();
-    const tagRow = row || (await db.prepare("SELECT id FROM tags WHERE name = ?").bind(tag).first());
-    await db
-      .prepare(
-        "INSERT OR IGNORE INTO entity_tags (entity_type, entity_id, tag_id) VALUES (?, ?, ?)",
-      )
-      .bind(entityType, entityId, tagRow.id)
-      .run();
-  }
-}
-
-async function createTextEntity(env, table, entityType, projectId, text) {
+async function createTextEntity(env, table, entityType, projectId, text, authorId = null) {
   const cleanText = text.trim();
   if (!cleanText) {
     throw new Error("Текст не может быть пустым");
   }
 
-  const row = await env.DB
-    .prepare(`INSERT INTO ${table} (project_id, text, created_at) VALUES (?, ?, datetime('now')) RETURNING *`)
-    .bind(projectId, cleanText)
-    .first();
-  await saveTags(env.DB, entityType, row.id, cleanText);
-  return row;
+  return await createRepositoryTextEntity(env.DB, {
+    table,
+    entityType,
+    projectId,
+    text: cleanText,
+    authorId,
+    source: "telegram",
+  });
 }
 
 async function handleStart(env, message) {
@@ -161,7 +137,7 @@ async function handleProjects(env, message) {
   await sendMessage(env, message.chat.id, `Проекты:\n${results.map((item) => `- ${item.name}`).join("\n")}`);
 }
 
-async function handleIdea(env, message) {
+async function handleIdea(env, message, user) {
   const text = commandPayload(message);
   if (!text) {
     await sendMessage(env, message.chat.id, "Добавьте текст идеи: /idea текст");
@@ -169,11 +145,11 @@ async function handleIdea(env, message) {
   }
   const project = await requireActiveProject(env, message);
   if (!project) return;
-  const idea = await createTextEntity(env, "ideas", "idea", project.id, text);
+  const idea = await createTextEntity(env, "ideas", "idea", project.id, text, user?.id || null);
   await sendMessage(env, message.chat.id, `Идея сохранена: #${idea.id}`);
 }
 
-async function handleTask(env, message) {
+async function handleTask(env, message, user) {
   const text = commandPayload(message);
   if (!text) {
     await sendMessage(env, message.chat.id, "Добавьте текст задачи: /task текст");
@@ -181,13 +157,12 @@ async function handleTask(env, message) {
   }
   const project = await requireActiveProject(env, message);
   if (!project) return;
-  const task = await env.DB
-    .prepare(
-      "INSERT INTO tasks (project_id, text, status, created_at) VALUES (?, ?, 'todo', datetime('now')) RETURNING *",
-    )
-    .bind(project.id, text.trim())
-    .first();
-  await saveTags(env.DB, "task", task.id, text);
+  const task = await createTask(env.DB, {
+    projectId: project.id,
+    text,
+    authorId: user?.id || null,
+    source: "telegram",
+  });
   await sendMessage(env, message.chat.id, `Задача создана: #${task.id}`);
 }
 
@@ -196,7 +171,7 @@ async function handleTasks(env, message) {
   if (!project) return;
 
   const { results } = await env.DB
-    .prepare("SELECT id, text, status FROM tasks WHERE project_id = ? ORDER BY status, created_at DESC")
+    .prepare("SELECT id, text, status FROM tasks WHERE project_id = ? AND is_deleted = 0 ORDER BY status, created_at DESC")
     .bind(project.id)
     .all();
 
@@ -209,7 +184,7 @@ async function handleTasks(env, message) {
   await sendMessage(env, message.chat.id, lines.join("\n"));
 }
 
-async function handleTaskDone(env, message) {
+async function handleTaskDone(env, message, user) {
   const payload = commandPayload(message);
   const taskId = Number.parseInt(payload, 10);
   if (!Number.isInteger(taskId)) {
@@ -221,7 +196,7 @@ async function handleTaskDone(env, message) {
   if (!project) return;
 
   const result = await env.DB
-    .prepare("UPDATE tasks SET status = 'done' WHERE id = ? AND project_id = ?")
+    .prepare("UPDATE tasks SET status = 'done', updated_at = datetime('now') WHERE id = ? AND project_id = ? AND is_deleted = 0")
     .bind(taskId, project.id)
     .run();
 
@@ -229,10 +204,17 @@ async function handleTaskDone(env, message) {
     await sendMessage(env, message.chat.id, "Задача не найдена в текущем проекте.");
     return;
   }
+  await auditLog(env.DB, {
+    userId: user?.id || null,
+    action: "task.status_changed",
+    entityType: "task",
+    entityId: taskId,
+    details: { project_id: project.id, new_status: "done", source: "telegram" },
+  });
   await sendMessage(env, message.chat.id, `Задача #${taskId} завершена.`);
 }
 
-async function handleNote(env, message) {
+async function handleNote(env, message, user) {
   const text = commandPayload(message);
   if (!text) {
     await sendMessage(env, message.chat.id, "Добавьте текст заметки: /note текст");
@@ -240,11 +222,11 @@ async function handleNote(env, message) {
   }
   const project = await requireActiveProject(env, message);
   if (!project) return;
-  const note = await createTextEntity(env, "notes", "note", project.id, text);
+  const note = await createTextEntity(env, "notes", "note", project.id, text, user?.id || null);
   await sendMessage(env, message.chat.id, `Заметка сохранена: #${note.id}`);
 }
 
-async function handleDecision(env, message) {
+async function handleDecision(env, message, user) {
   const text = commandPayload(message);
   if (!text) {
     await sendMessage(env, message.chat.id, "Добавьте текст решения: /decision текст");
@@ -252,11 +234,11 @@ async function handleDecision(env, message) {
   }
   const project = await requireActiveProject(env, message);
   if (!project) return;
-  const decision = await createTextEntity(env, "decisions", "decision", project.id, text);
+  const decision = await createTextEntity(env, "decisions", "decision", project.id, text, user?.id || null);
   await sendMessage(env, message.chat.id, `Решение сохранено: #${decision.id}`);
 }
 
-async function handleLink(env, message) {
+async function handleLink(env, message, user) {
   const payload = commandPayload(message);
   if (!payload) {
     await sendMessage(env, message.chat.id, "Добавьте ссылку: /link https://example.com описание");
@@ -272,20 +254,20 @@ async function handleLink(env, message) {
 
   const project = await requireActiveProject(env, message);
   if (!project) return;
-  const link = await env.DB
-    .prepare(
-      "INSERT INTO links (project_id, url, description, created_at) VALUES (?, ?, ?, datetime('now')) RETURNING *",
-    )
-    .bind(project.id, url.trim(), description || null)
-    .first();
-  await saveTags(env.DB, "link", link.id, `${url} ${description}`);
+  const link = await createLink(env.DB, {
+    projectId: project.id,
+    url,
+    description,
+    authorId: user?.id || null,
+    source: "telegram",
+  });
   await sendMessage(env, message.chat.id, `Ссылка сохранена: #${link.id}`);
 }
 
 async function searchTable(db, table, kind, projectId, query) {
   const textColumn = table === "links" ? "COALESCE(url, '') || ' ' || COALESCE(description, '')" : "text";
   const { results } = await db
-    .prepare(`SELECT id, ${textColumn} AS text FROM ${table} WHERE project_id = ? AND ${textColumn} LIKE ? LIMIT 10`)
+    .prepare(`SELECT id, ${textColumn} AS text FROM ${table} WHERE project_id = ? AND is_deleted = 0 AND ${textColumn} LIKE ? LIMIT 10`)
     .bind(projectId, `%${query}%`)
     .all();
   return results.map((row) => `${kind} #${row.id}: ${row.text}`);
@@ -324,6 +306,8 @@ async function handleTelegramUpdate(env, update) {
     return;
   }
 
+  const user = await findUserByTelegramId(env.DB, message.from.id);
+
   const text = message.text || message.caption || "";
   const command = text.split(/\s+/, 1)[0].split("@", 1)[0];
 
@@ -339,25 +323,25 @@ async function handleTelegramUpdate(env, update) {
       await handleProjects(env, message);
       break;
     case "/idea":
-      await handleIdea(env, message);
+      await handleIdea(env, message, user);
       break;
     case "/task":
-      await handleTask(env, message);
+      await handleTask(env, message, user);
       break;
     case "/tasks":
       await handleTasks(env, message);
       break;
     case "/task_done":
-      await handleTaskDone(env, message);
+      await handleTaskDone(env, message, user);
       break;
     case "/note":
-      await handleNote(env, message);
+      await handleNote(env, message, user);
       break;
     case "/decision":
-      await handleDecision(env, message);
+      await handleDecision(env, message, user);
       break;
     case "/link":
-      await handleLink(env, message);
+      await handleLink(env, message, user);
       break;
     case "/find":
       await handleFind(env, message);
@@ -375,7 +359,13 @@ export default {
       return json({ status: "ok" });
     }
 
-    if (url.pathname === "/" || url.pathname.startsWith("/app") || url.pathname.startsWith("/api")) {
+    if (
+      url.pathname === "/" ||
+      url.pathname === "/login" ||
+      url.pathname === "/logout" ||
+      url.pathname.startsWith("/app") ||
+      url.pathname.startsWith("/api")
+    ) {
       return await handleWebRequest(request, env);
     }
 
