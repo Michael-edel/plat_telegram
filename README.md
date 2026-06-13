@@ -56,6 +56,65 @@ docker compose up --build
 
 SQLite хранится в persistent volume `bot_data`.
 
+## Запуск через Cloudflare HTTPS
+
+Бот поддерживает два режима:
+
+- `APP_MODE=polling` - локальная разработка без публичного HTTPS.
+- `APP_MODE=webhook` - запуск через публичный HTTPS URL, например через Cloudflare Tunnel.
+
+Для работы через Cloudflare Dashboard настройте Tunnel так, чтобы публичный hostname вёл на локальный сервис:
+
+```text
+http://bot:8080
+```
+
+Если бот запущен не внутри `docker-compose`, а напрямую на сервере, укажите origin service:
+
+```text
+http://localhost:8080
+```
+
+Пример `.env` для Cloudflare:
+
+```env
+APP_MODE=webhook
+WEBHOOK_BASE_URL=https://bot.example.com
+WEBHOOK_PATH=/telegram/webhook
+WEBHOOK_SECRET=change-this-secret-token
+WEB_SERVER_HOST=0.0.0.0
+WEB_SERVER_PORT=8080
+```
+
+`WEBHOOK_BASE_URL` должен быть вашим публичным HTTPS-адресом из Cloudflare. Итоговый webhook Telegram будет:
+
+```text
+https://bot.example.com/telegram/webhook
+```
+
+### Docker Compose с Cloudflare Tunnel
+
+1. В Cloudflare Dashboard создайте Tunnel.
+2. В Public Hostname укажите домен или поддомен.
+3. В Service укажите `http://bot:8080`.
+4. Скопируйте token tunnel в `.env`:
+
+```env
+CLOUDFLARE_TUNNEL_TOKEN=your_cloudflare_tunnel_token
+```
+
+5. Запустите:
+
+```bash
+docker compose --profile cloudflare up --build
+```
+
+Для обычного запуска без Cloudflare:
+
+```bash
+docker compose up --build
+```
+
 ## Настройка ALLOWED_USERS
 
 В `.env` укажите Telegram user_id пользователей через запятую:
