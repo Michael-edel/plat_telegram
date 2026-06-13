@@ -1,7 +1,7 @@
 const SESSION_COOKIE = "pp_session";
 const CSRF_COOKIE = "pp_csrf";
 const SESSION_TTL_SECONDS = 60 * 60 * 12;
-const PASSWORD_ITERATIONS = 210000;
+const PASSWORD_ITERATIONS = 100000;
 
 export const ROLES = ["admin", "editor", "viewer"];
 export const WRITE_ROLES = ["admin", "editor"];
