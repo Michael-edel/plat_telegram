@@ -47,14 +47,14 @@ database_id = "..."
 
 ```toml
 routes = [
-  { pattern = "bot.example.com", custom_domain = true }
+  { pattern = "bot.edel.kz", custom_domain = true }
 ]
 ```
 
 Итоговый Telegram webhook URL будет:
 
 ```text
-https://bot.example.com/telegram/webhook
+https://bot.edel.kz/telegram/webhook
 ```
 
 ## GitHub Secrets
@@ -72,7 +72,7 @@ Settings -> Secrets and variables -> Actions -> New repository secret
 - `BOT_TOKEN` - token Telegram-бота.
 - `ALLOWED_USERS` - Telegram user_id через запятую, например `111111111,222222222`.
 - `WEBHOOK_SECRET` - произвольная секретная строка для проверки Telegram webhook.
-- `WEBHOOK_URL` - полный URL webhook, например `https://bot.example.com/telegram/webhook`.
+- `WEBHOOK_URL` - полный URL webhook: `https://bot.edel.kz/telegram/webhook`.
 
 Workflow сам загрузит `BOT_TOKEN`, `WEBHOOK_SECRET` и `ALLOWED_USERS` в Worker secrets через Wrangler.
 
@@ -108,13 +108,13 @@ npm run db:migrate:local
 Healthcheck:
 
 ```text
-https://bot.example.com/health
+https://bot.edel.kz/health
 ```
 
 Webhook endpoint:
 
 ```text
-https://bot.example.com/telegram/webhook
+https://bot.edel.kz/telegram/webhook
 ```
 
 ## Legacy Python

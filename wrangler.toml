@@ -3,10 +3,8 @@ main = "src/worker.js"
 compatibility_date = "2026-06-13"
 workers_dev = false
 
-# Replace the pattern with your real Cloudflare domain before the first deploy.
-# Example: pattern = "bot.example.com"
 routes = [
-  { pattern = "bot.example.com", custom_domain = true }
+  { pattern = "bot.edel.kz", custom_domain = true }
 ]
 
 [[d1_databases]]
