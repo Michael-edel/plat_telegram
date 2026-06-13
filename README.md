@@ -25,25 +25,25 @@
 
 Команды `/idea`, `/task`, `/note`, `/decision` и `/link` поддерживают reply-режим.
 
-## Что нужно создать в Cloudflare
+## Cloudflare
 
-1. Добавьте домен в Cloudflare и дождитесь активного статуса зоны.
-2. Создайте D1 database:
+Домен `michael.kz` добавлен в Cloudflare и активирован через nameservers:
 
-```bash
-npx wrangler d1 create plat_telegram
+```text
+hadlee.ns.cloudflare.com
+kolton.ns.cloudflare.com
 ```
 
-3. Скопируйте `database_id` из вывода команды в `wrangler.toml`:
+D1 database для проекта уже создана:
 
 ```toml
 [[d1_databases]]
 binding = "DB"
 database_name = "plat_telegram"
-database_id = "..."
+database_id = "e9450fe2-08cc-4f04-b9d9-14e9ce6d0c8b"
 ```
 
-4. В `wrangler.toml` замените route на ваш домен:
+Worker будет доступен на поддомене:
 
 ```toml
 routes = [
