@@ -4,7 +4,7 @@ compatibility_date = "2026-06-13"
 workers_dev = false
 
 routes = [
-  { pattern = "bot.edel.kz", custom_domain = true }
+  { pattern = "bot.michael.kz", custom_domain = true }
 ]
 
 [[d1_databases]]
