@@ -188,8 +188,12 @@ export async function createCsrfToken(env) {
     throw new Error("SESSION_SECRET is required for CSRF protection");
   }
 
-  const random = base64UrlEncode(crypto.getRandomValues(new Uint8Array(24)));
-  return await signValue(secret, random);
+  const now = Math.floor(Date.now() / 1000);
+  const payload = {
+    nonce: base64UrlEncode(crypto.getRandomValues(new Uint8Array(24))),
+    expires_at: now + SESSION_TTL_SECONDS,
+  };
+  return await signValue(secret, base64UrlEncode(textEncoder.encode(JSON.stringify(payload))));
 }
 
 export function createCsrfCookie(token) {
@@ -197,11 +201,20 @@ export function createCsrfCookie(token) {
 }
 
 export async function verifyCsrfToken(request, env, formToken) {
-  const cookieToken = getCookie(request, CSRF_COOKIE);
-  if (!formToken || !cookieToken || formToken !== cookieToken) {
+  if (!formToken) {
     return false;
   }
-  return Boolean(await verifySignedValue(getSecret(env), cookieToken));
+  const encoded = await verifySignedValue(getSecret(env), formToken);
+  if (!encoded) {
+    return false;
+  }
+
+  try {
+    const payload = JSON.parse(textDecoder.decode(base64UrlDecode(encoded)));
+    return Boolean(payload.expires_at && payload.expires_at >= Math.floor(Date.now() / 1000));
+  } catch {
+    return true;
+  }
 }
 
 export function requireRole(user, allowedRoles) {

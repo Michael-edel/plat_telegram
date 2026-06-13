@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { hashPassword, verifyPassword } from "../src/auth.js";
+import { createCsrfToken, hashPassword, verifyCsrfToken, verifyPassword } from "../src/auth.js";
 import { commandPayload, extractHashtags, isTaskStatus, isValidUrl, parseAllowedUsers } from "../src/utils.js";
 
 test("extractHashtags returns unique lower-case tags", () => {
@@ -42,4 +42,13 @@ test("password hashes verify only matching passwords", async () => {
   assert.equal(hash.startsWith("pbkdf2:sha256:"), true);
   assert.equal(await verifyPassword("correct horse battery staple", hash), true);
   assert.equal(await verifyPassword("wrong password", hash), false);
+});
+
+test("csrf token verifies without a cookie", async () => {
+  const env = { SESSION_SECRET: "test-session-secret" };
+  const request = new Request("https://bot.example/login", { method: "POST" });
+  const token = await createCsrfToken(env);
+
+  assert.equal(await verifyCsrfToken(request, env, token), true);
+  assert.equal(await verifyCsrfToken(request, env, "bad-token"), false);
 });
