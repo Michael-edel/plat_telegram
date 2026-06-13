@@ -22,9 +22,13 @@ import {
   getProject,
   getUser,
   listAudit,
+  listDeletedEntities,
+  listProjectAuthors,
+  listProjectTags,
   listProjects,
   listUsers,
   loadProjectData,
+  restoreEntity,
   searchProject,
   softDeleteLink,
   softDeleteTask,
@@ -105,7 +109,7 @@ async function renderPage(env, user, { title, content }) {
 
 function renderLayout({ title, content, user, csrfToken }) {
   const adminLinks = isAdmin(user)
-    ? `<a href="/app/users">Пользователи</a><a href="/app/audit">Аудит</a>`
+    ? `<a href="/app/users">Пользователи</a><a href="/app/deleted">Удалённые</a><a href="/app/audit">Аудит</a>`
     : "";
   return `<!doctype html>
 <html lang="ru">
@@ -219,8 +223,10 @@ function renderLayout({ title, content, user, csrfToken }) {
     .inline-form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .inline-form select { min-width: 105px; }
     .search { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+    .filters { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)) auto; gap: 8px; align-items: end; margin-bottom: 12px; }
     .section-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
     .badge { display: inline-flex; align-items: center; border-radius: 999px; padding: 2px 8px; font-size: 12px; background: #e5e7eb; color: #111827; }
+    .tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
     .role-admin { background: #fee4e2; color: #912018; }
     .role-editor { background: #dbeafe; color: #1e3a8a; }
     .role-viewer { background: #dcfce7; color: #14532d; }
@@ -228,7 +234,7 @@ function renderLayout({ title, content, user, csrfToken }) {
     th, td { padding: 10px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
     @media (max-width: 1100px) {
       .shell { grid-template-columns: 1fr; }
-      .grid.two, .section-grid, .columns, .stats { grid-template-columns: 1fr; }
+      .grid.two, .section-grid, .columns, .stats, .filters { grid-template-columns: 1fr; }
       .main { padding: 18px; }
       .topbar { align-items: flex-start; flex-direction: column; }
     }
@@ -324,6 +330,33 @@ function projectRedirect(projectId) {
   return `/app/projects/${encodeURIComponent(projectId)}`;
 }
 
+function cleanFilter(value) {
+  return String(value || "").trim();
+}
+
+function selected(value, current) {
+  return String(value) === String(current || "") ? "selected" : "";
+}
+
+function renderTags(tags) {
+  const values = String(tags || "")
+    .split(",")
+    .map((tag) => tag.trim())
+    .filter(Boolean);
+  return values.length ? `<div class="tags">${values.map((tag) => `<span class="badge">#${escapeHtml(tag)}</span>`).join("")}</div>` : "";
+}
+
+function projectFilterParams(url) {
+  const status = cleanFilter(url.searchParams.get("status"));
+  const authorId = Number.parseInt(url.searchParams.get("author_id") || "", 10);
+  return {
+    q: cleanFilter(url.searchParams.get("q")),
+    status: isTaskStatus(status) ? status : "",
+    authorId: Number.isInteger(authorId) ? authorId : "",
+    tag: cleanFilter(url.searchParams.get("tag")).replace(/^#/, "").toLowerCase(),
+  };
+}
+
 function renderDashboard(projects, user, csrfToken) {
   const totals = projects.reduce(
     (acc, project) => {
@@ -414,6 +447,7 @@ function renderTask(task, projectId, user, csrfToken) {
     : "";
   return `<article class="task">
     <div>#${task.id} ${escapeHtml(task.text)}</div>
+    ${renderTags(task.tags)}
     ${entityMeta(task)}
     <div class="task-footer">${actions}</div>
   </article>`;
@@ -438,7 +472,7 @@ function renderTextCards(items, path, projectId, user, csrfToken) {
             <button class="danger" type="submit">Удалить</button>
           </form>`
         : "";
-      return `<article class="card"><div>#${item.id} ${escapeHtml(item.text)}</div>${entityMeta(item)}${actions}</article>`;
+      return `<article class="card"><div>#${item.id} ${escapeHtml(item.text)}</div>${renderTags(item.tags)}${entityMeta(item)}${actions}</article>`;
     })
     .join("");
 }
@@ -466,6 +500,7 @@ function renderLinks(items, projectId, user, csrfToken) {
       return `<article class="card">
         <div><a href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(item.url)}</a></div>
         <div>${escapeHtml(item.description || "")}</div>
+        ${renderTags(item.tags)}
         ${entityMeta(item)}
         ${actions}
       </article>`;
@@ -515,7 +550,17 @@ function renderCreateForms(projectId, user, csrfToken) {
   </section>`;
 }
 
-function renderProject(project, data, searchResults, query, user, csrfToken) {
+function renderProject(project, data, searchResults, filters, filterOptions, user, csrfToken) {
+  const query = filters.q || "";
+  const statusOptions = ["", "todo", "doing", "review", "done"]
+    .map((status) => `<option value="${status}" ${selected(status, filters.status)}>${status || "Все статусы"}</option>`)
+    .join("");
+  const authorOptions = [{ id: "", name: "Все авторы" }, ...filterOptions.authors]
+    .map((author) => `<option value="${author.id}" ${selected(author.id, filters.authorId)}>${escapeHtml(author.name)}</option>`)
+    .join("");
+  const tagOptions = [{ name: "" }, ...filterOptions.tags]
+    .map((tag) => `<option value="${escapeHtml(tag.name)}" ${selected(tag.name, filters.tag)}>${tag.name ? `#${escapeHtml(tag.name)}` : "Все теги"}</option>`)
+    .join("");
   const taskColumns = ["todo", "doing", "review", "done"]
     .map((status) => {
       const tasks = data.tasks.filter((task) => task.status === status);
@@ -528,11 +573,15 @@ function renderProject(project, data, searchResults, query, user, csrfToken) {
       <a class="button secondary" href="/app">Все проекты</a>
     </div>
     <section class="panel" id="search">
-      <h2>Поиск</h2>
-      <form class="search" method="get" action="/app/projects/${project.id}">
-        <input name="q" value="${escapeHtml(query)}" placeholder="Искать по проекту">
+      <h2>Фильтры и поиск</h2>
+      <form class="filters" method="get" action="/app/projects/${project.id}">
+        <label>Статус<select name="status">${statusOptions}</select></label>
+        <label>Автор<select name="author_id">${authorOptions}</select></label>
+        <label>Тег<select name="tag">${tagOptions}</select></label>
+        <label>Поиск<input name="q" value="${escapeHtml(query)}" placeholder="Текст"></label>
         <button type="submit">Найти</button>
       </form>
+      <a class="button secondary" href="/app/projects/${project.id}">Сбросить</a>
       ${renderSearchResults(searchResults, query)}
     </section>
     <div class="grid two" style="margin-top:16px">
@@ -549,7 +598,7 @@ function renderProject(project, data, searchResults, query, user, csrfToken) {
     </div>`;
 }
 
-function renderUsersPage(users, csrfToken) {
+function renderUsersPage(users, filters, csrfToken) {
   const rows = users
     .map(
       (user) => `<tr>
@@ -557,6 +606,7 @@ function renderUsersPage(users, csrfToken) {
         <td>${escapeHtml(user.username)}<br><span class="muted">${escapeHtml(user.display_name || "")}</span></td>
         <td>${roleBadge(user)}</td>
         <td>${escapeHtml(user.telegram_id || "—")}</td>
+        <td>${escapeHtml(formatDate(user.last_login_at))}</td>
         <td>${user.is_active ? "активен" : "отключён"}</td>
         <td>
           <form class="inline-form" method="post" action="/app/users/${user.id}/role">
@@ -582,10 +632,26 @@ function renderUsersPage(users, csrfToken) {
     .join("");
 
   return `<div class="topbar"><h1>Пользователи</h1><a class="button secondary" href="/app">Проекты</a></div>
+    <section class="panel" style="margin-bottom:16px">
+      <h2>Фильтры</h2>
+      <form class="filters" method="get" action="/app/users">
+        <label>Роль<select name="role">
+          <option value="">Все роли</option>
+          ${["admin", "editor", "viewer"].map((role) => `<option value="${role}" ${selected(role, filters.role)}>${role}</option>`).join("")}
+        </select></label>
+        <label>Статус<select name="active">
+          <option value="">Все</option>
+          <option value="1" ${selected("1", filters.active)}>Активные</option>
+          <option value="0" ${selected("0", filters.active)}>Отключённые</option>
+        </select></label>
+        <button type="submit">Применить</button>
+        <a class="button secondary" href="/app/users">Сбросить</a>
+      </form>
+    </section>
     <div class="grid two">
       <section class="panel">
         <h2>Список пользователей</h2>
-        <table><thead><tr><th>ID</th><th>Пользователь</th><th>Роль</th><th>Telegram ID</th><th>Статус</th><th>Действия</th></tr></thead><tbody>${rows}</tbody></table>
+        <table><thead><tr><th>ID</th><th>Пользователь</th><th>Роль</th><th>Telegram ID</th><th>Последний вход</th><th>Статус</th><th>Действия</th></tr></thead><tbody>${rows}</tbody></table>
       </section>
       <section class="panel">
         <h2>Создать пользователя</h2>
@@ -602,7 +668,7 @@ function renderUsersPage(users, csrfToken) {
     </div>`;
 }
 
-function renderAuditPage(rows) {
+function renderAuditPage(rows, filters) {
   const body = rows
     .map(
       (row) => `<tr>
@@ -615,8 +681,48 @@ function renderAuditPage(rows) {
     )
     .join("");
   return `<div class="topbar"><h1>Аудит</h1><a class="button secondary" href="/app">Проекты</a></div>
+    <section class="panel" style="margin-bottom:16px">
+      <h2>Фильтры</h2>
+      <form class="filters" method="get" action="/app/audit">
+        <label>User ID<input name="user_id" value="${escapeHtml(filters.userId || "")}" placeholder="ID"></label>
+        <label>Действие<input name="action" value="${escapeHtml(filters.action || "")}" placeholder="login, task"></label>
+        <label>Тип<select name="entity_type">
+          <option value="">Все</option>
+          ${["project", "task", "idea", "note", "decision", "link", "user"].map((type) => `<option value="${type}" ${selected(type, filters.entityType)}>${type}</option>`).join("")}
+        </select></label>
+        <button type="submit">Применить</button>
+        <a class="button secondary" href="/app/audit">Сбросить</a>
+      </form>
+    </section>
     <section class="panel">
       <table><thead><tr><th>Дата</th><th>Пользователь</th><th>Действие</th><th>Сущность</th><th>Детали</th></tr></thead><tbody>${body}</tbody></table>
+    </section>`;
+}
+
+function renderDeletedPage(rows, csrfToken) {
+  const body = rows.length
+    ? rows
+        .map(
+          (row) => `<tr>
+            <td>${escapeHtml(formatDate(row.deleted_at))}</td>
+            <td>${escapeHtml(row.project_name)}</td>
+            <td>${escapeHtml(row.entity_type)} #${row.id}</td>
+            <td>${escapeHtml(row.title)}</td>
+            <td>${escapeHtml(row.author_name || "—")}</td>
+            <td>
+              <form method="post" action="/app/deleted/${encodeURIComponent(row.entity_type)}/${row.id}/restore">
+                <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+                <button class="secondary" type="submit">Восстановить</button>
+              </form>
+            </td>
+          </tr>`,
+        )
+        .join("")
+    : `<tr><td colspan="6" class="muted">Удалённых записей нет.</td></tr>`;
+
+  return `<div class="topbar"><h1>Удалённые записи</h1><a class="button secondary" href="/app">Проекты</a></div>
+    <section class="panel">
+      <table><thead><tr><th>Удалено</th><th>Проект</th><th>Тип</th><th>Текст</th><th>Автор</th><th>Действие</th></tr></thead><tbody>${body}</tbody></table>
     </section>`;
 }
 
@@ -669,15 +775,17 @@ async function handleProjectPage(env, request, user, projectId) {
   const project = await getProject(env.DB, projectId);
   if (!project) return renderErrorPage("Проект не найден", 404);
   const url = new URL(request.url);
-  const query = url.searchParams.get("q") || "";
-  const [data, searchResults] = await Promise.all([
-    loadProjectData(env.DB, project.id),
-    query ? searchProject(env.DB, project.id, query) : Promise.resolve([]),
+  const filters = projectFilterParams(url);
+  const [data, searchResults, authors, tags] = await Promise.all([
+    loadProjectData(env.DB, project.id, filters),
+    filters.q ? searchProject(env.DB, project.id, filters.q, filters) : Promise.resolve([]),
+    listProjectAuthors(env.DB, project.id),
+    listProjectTags(env.DB, project.id),
   ]);
   const csrfToken = await createCsrfToken(env);
   const headers = new Headers();
   appendSetCookie(headers, createCsrfCookie(csrfToken));
-  return html(renderLayout({ title: project.name, content: renderProject(project, data, searchResults, query, user, csrfToken), user, csrfToken }), {
+  return html(renderLayout({ title: project.name, content: renderProject(project, data, searchResults, filters, { authors, tags }, user, csrfToken), user, csrfToken }), {
     headers,
   });
 }
@@ -804,21 +912,49 @@ async function handleLinkDelete(env, request, user, linkId) {
   return redirect(projectRedirect(projectId));
 }
 
-async function handleUsersPage(env, user) {
+async function handleUsersPage(env, request, user) {
   if (!isAdmin(user)) return forbiddenResponse(false);
-  const users = await listUsers(env.DB);
+  const url = new URL(request.url);
+  const filters = {
+    role: ["admin", "editor", "viewer"].includes(url.searchParams.get("role")) ? url.searchParams.get("role") : "",
+    active: ["0", "1"].includes(url.searchParams.get("active")) ? url.searchParams.get("active") : "",
+  };
+  const users = await listUsers(env.DB, filters);
   const csrfToken = await createCsrfToken(env);
   const headers = new Headers();
   appendSetCookie(headers, createCsrfCookie(csrfToken));
-  return html(renderLayout({ title: "Пользователи", content: renderUsersPage(users, csrfToken), user, csrfToken }), { headers });
+  return html(renderLayout({ title: "Пользователи", content: renderUsersPage(users, filters, csrfToken), user, csrfToken }), { headers });
 }
 
-async function handleAuditPage(env, user) {
+async function handleAuditPage(env, request, user) {
+  if (!isAdmin(user)) return forbiddenResponse(false);
+  const url = new URL(request.url);
+  const userId = Number.parseInt(url.searchParams.get("user_id") || "", 10);
+  const filters = {
+    userId: Number.isInteger(userId) ? userId : "",
+    action: cleanFilter(url.searchParams.get("action")),
+    entityType: cleanFilter(url.searchParams.get("entity_type")),
+  };
+  const csrfToken = await createCsrfToken(env);
+  const headers = new Headers();
+  appendSetCookie(headers, createCsrfCookie(csrfToken));
+  return html(renderLayout({ title: "Аудит", content: renderAuditPage(await listAudit(env.DB, filters), filters), user, csrfToken }), { headers });
+}
+
+async function handleDeletedPage(env, user) {
   if (!isAdmin(user)) return forbiddenResponse(false);
   const csrfToken = await createCsrfToken(env);
   const headers = new Headers();
   appendSetCookie(headers, createCsrfCookie(csrfToken));
-  return html(renderLayout({ title: "Аудит", content: renderAuditPage(await listAudit(env.DB)), user, csrfToken }), { headers });
+  return html(renderLayout({ title: "Удалённые", content: renderDeletedPage(await listDeletedEntities(env.DB), csrfToken), user, csrfToken }), { headers });
+}
+
+async function handleRestoreDeleted(env, request, user, entityType, entityId) {
+  if (!isAdmin(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const restored = await restoreEntity(env.DB, { entityType, entityId, userId: user.id });
+  return redirect(projectRedirect(restored.project_id));
 }
 
 async function handleCreateUser(env, request, user) {
@@ -1099,8 +1235,9 @@ export async function handleWebRequest(request, env) {
       return await handleProjectPage(env, request, user, Number.parseInt(projectMatch[1], 10));
     }
 
-    if (request.method === "GET" && url.pathname === "/app/users") return await handleUsersPage(env, user);
-    if (request.method === "GET" && url.pathname === "/app/audit") return await handleAuditPage(env, user);
+    if (request.method === "GET" && url.pathname === "/app/users") return await handleUsersPage(env, request, user);
+    if (request.method === "GET" && url.pathname === "/app/deleted") return await handleDeletedPage(env, user);
+    if (request.method === "GET" && url.pathname === "/app/audit") return await handleAuditPage(env, request, user);
 
     if (request.method === "POST" && url.pathname === "/app/projects") return await handleCreateProject(env, request, user);
     if (request.method === "POST" && url.pathname === "/app/tasks") return await handleCreateTask(env, request, user);
@@ -1132,12 +1269,16 @@ export async function handleWebRequest(request, env) {
     }
 
     const userAction = url.pathname.match(/^\/app\/users\/(\d+)\/(role|status|password)$/);
+    const restoreAction = url.pathname.match(/^\/app\/deleted\/([a-z]+)\/(\d+)\/restore$/);
     if (request.method === "POST" && url.pathname === "/app/users") return await handleCreateUser(env, request, user);
     if (request.method === "POST" && userAction) {
       const targetId = Number.parseInt(userAction[1], 10);
       if (userAction[2] === "role") return await handleUserRole(env, request, user, targetId);
       if (userAction[2] === "status") return await handleUserStatus(env, request, user, targetId);
       return await handleUserPassword(env, request, user, targetId);
+    }
+    if (request.method === "POST" && restoreAction) {
+      return await handleRestoreDeleted(env, request, user, restoreAction[1], Number.parseInt(restoreAction[2], 10));
     }
 
     return renderErrorPage("Страница не найдена", 404);

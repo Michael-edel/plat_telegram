@@ -8,6 +8,14 @@ export const ENTITY_CONFIG = {
 
 export const WORK_ENTITY_TABLES = new Set(["tasks", "ideas", "notes", "decisions", "links"]);
 
+const ENTITY_TABLE_BY_TYPE = {
+  task: "tasks",
+  idea: "ideas",
+  note: "notes",
+  decision: "decisions",
+  link: "links",
+};
+
 function detailsJson(details) {
   return details ? JSON.stringify(details) : null;
 }
@@ -33,6 +41,7 @@ export async function findUserByTelegramId(db, telegramId) {
 
 export async function saveTags(db, entityType, entityId, text) {
   const tags = extractHashtags(text);
+  await db.prepare("DELETE FROM entity_tags WHERE entity_type = ? AND entity_id = ?").bind(entityType, entityId).run();
   for (const tag of tags) {
     const row = await db.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?) RETURNING id").bind(tag).first();
     const tagRow = row || (await db.prepare("SELECT id FROM tags WHERE name = ?").bind(tag).first());
@@ -41,6 +50,37 @@ export async function saveTags(db, entityType, entityId, text) {
       .bind(entityType, entityId, tagRow.id)
       .run();
   }
+}
+
+function tagsSelect(alias, entityType) {
+  return `(SELECT GROUP_CONCAT(tg.name, ', ')
+          FROM entity_tags et
+          JOIN tags tg ON tg.id = et.tag_id
+          WHERE et.entity_type = '${entityType}' AND et.entity_id = ${alias}.id) AS tags`;
+}
+
+function addProjectFilters(baseWhere, filters = {}, alias = "t", entityType = "task") {
+  const conditions = [...baseWhere];
+  const bindings = [];
+  if (filters.authorId) {
+    conditions.push(`${alias}.author_id = ?`);
+    bindings.push(filters.authorId);
+  }
+  if (filters.tag) {
+    conditions.push(
+      `EXISTS (
+        SELECT 1 FROM entity_tags et
+        JOIN tags tg ON tg.id = et.tag_id
+        WHERE et.entity_type = ? AND et.entity_id = ${alias}.id AND tg.name = ?
+      )`,
+    );
+    bindings.push(entityType, filters.tag);
+  }
+  return { whereSql: conditions.join(" AND "), bindings };
+}
+
+function bindOptional(statement, bindings) {
+  return bindings.length ? statement.bind(...bindings) : statement;
 }
 
 export async function getOrCreateProject(db, name, userId = null, source = "web") {
@@ -100,57 +140,67 @@ function authorSelect(alias = "u") {
   return `COALESCE(${alias}.display_name, ${alias}.username, '—') AS author_name`;
 }
 
-export async function loadProjectData(db, projectId) {
+export async function loadProjectData(db, projectId, filters = {}) {
+  const taskFilters = addProjectFilters(["t.project_id = ?", "t.is_deleted = 0"], filters, "t", "task");
+  const ideaFilters = addProjectFilters(["i.project_id = ?", "i.is_deleted = 0"], filters, "i", "idea");
+  const noteFilters = addProjectFilters(["n.project_id = ?", "n.is_deleted = 0"], filters, "n", "note");
+  const decisionFilters = addProjectFilters(["d.project_id = ?", "d.is_deleted = 0"], filters, "d", "decision");
+  const linkFilters = addProjectFilters(["l.project_id = ?", "l.is_deleted = 0"], filters, "l", "link");
+  if (filters.status) {
+    taskFilters.whereSql += " AND t.status = ?";
+    taskFilters.bindings.push(filters.status);
+  }
+
   const [tasks, ideas, notes, decisions, links] = await Promise.all([
     db
       .prepare(
-        `SELECT t.id, t.text, t.status, t.created_at, t.updated_at, t.author_id, ${authorSelect()}
+        `SELECT t.id, t.text, t.status, t.created_at, t.updated_at, t.author_id, ${authorSelect()}, ${tagsSelect("t", "task")}
          FROM tasks t
          LEFT JOIN users u ON u.id = t.author_id
-         WHERE t.project_id = ? AND t.is_deleted = 0
+         WHERE ${taskFilters.whereSql}
          ORDER BY t.created_at DESC`,
       )
-      .bind(projectId)
+      .bind(projectId, ...taskFilters.bindings)
       .all(),
     db
       .prepare(
-        `SELECT i.id, i.text, i.created_at, i.updated_at, i.author_id, ${authorSelect()}
+        `SELECT i.id, i.text, i.created_at, i.updated_at, i.author_id, ${authorSelect()}, ${tagsSelect("i", "idea")}
          FROM ideas i
          LEFT JOIN users u ON u.id = i.author_id
-         WHERE i.project_id = ? AND i.is_deleted = 0
+         WHERE ${ideaFilters.whereSql}
          ORDER BY i.created_at DESC LIMIT 100`,
       )
-      .bind(projectId)
+      .bind(projectId, ...ideaFilters.bindings)
       .all(),
     db
       .prepare(
-        `SELECT n.id, n.text, n.created_at, n.updated_at, n.author_id, ${authorSelect()}
+        `SELECT n.id, n.text, n.created_at, n.updated_at, n.author_id, ${authorSelect()}, ${tagsSelect("n", "note")}
          FROM notes n
          LEFT JOIN users u ON u.id = n.author_id
-         WHERE n.project_id = ? AND n.is_deleted = 0
+         WHERE ${noteFilters.whereSql}
          ORDER BY n.created_at DESC LIMIT 100`,
       )
-      .bind(projectId)
+      .bind(projectId, ...noteFilters.bindings)
       .all(),
     db
       .prepare(
-        `SELECT d.id, d.text, d.created_at, d.updated_at, d.author_id, ${authorSelect()}
+        `SELECT d.id, d.text, d.created_at, d.updated_at, d.author_id, ${authorSelect()}, ${tagsSelect("d", "decision")}
          FROM decisions d
          LEFT JOIN users u ON u.id = d.author_id
-         WHERE d.project_id = ? AND d.is_deleted = 0
+         WHERE ${decisionFilters.whereSql}
          ORDER BY d.created_at DESC LIMIT 100`,
       )
-      .bind(projectId)
+      .bind(projectId, ...decisionFilters.bindings)
       .all(),
     db
       .prepare(
-        `SELECT l.id, l.url, l.description, l.created_at, l.updated_at, l.author_id, ${authorSelect()}
+        `SELECT l.id, l.url, l.description, l.created_at, l.updated_at, l.author_id, ${authorSelect()}, ${tagsSelect("l", "link")}
          FROM links l
          LEFT JOIN users u ON u.id = l.author_id
-         WHERE l.project_id = ? AND l.is_deleted = 0
+         WHERE ${linkFilters.whereSql}
          ORDER BY l.created_at DESC LIMIT 100`,
       )
-      .bind(projectId)
+      .bind(projectId, ...linkFilters.bindings)
       .all(),
   ]);
 
@@ -161,6 +211,45 @@ export async function loadProjectData(db, projectId) {
     decisions: decisions.results,
     links: links.results,
   };
+}
+
+export async function listProjectAuthors(db, projectId) {
+  const { results } = await db
+    .prepare(
+      `SELECT DISTINCT u.id, COALESCE(u.display_name, u.username) AS name
+       FROM users u
+       JOIN (
+         SELECT author_id FROM tasks WHERE project_id = ? AND is_deleted = 0
+         UNION SELECT author_id FROM ideas WHERE project_id = ? AND is_deleted = 0
+         UNION SELECT author_id FROM notes WHERE project_id = ? AND is_deleted = 0
+         UNION SELECT author_id FROM decisions WHERE project_id = ? AND is_deleted = 0
+         UNION SELECT author_id FROM links WHERE project_id = ? AND is_deleted = 0
+       ) a ON a.author_id = u.id
+       ORDER BY name`,
+    )
+    .bind(projectId, projectId, projectId, projectId, projectId)
+    .all();
+  return results;
+}
+
+export async function listProjectTags(db, projectId) {
+  const { results } = await db
+    .prepare(
+      `SELECT DISTINCT tg.name
+       FROM tags tg
+       JOIN entity_tags et ON et.tag_id = tg.id
+       LEFT JOIN tasks task ON et.entity_type = 'task' AND et.entity_id = task.id
+       LEFT JOIN ideas idea ON et.entity_type = 'idea' AND et.entity_id = idea.id
+       LEFT JOIN notes note ON et.entity_type = 'note' AND et.entity_id = note.id
+       LEFT JOIN decisions decision ON et.entity_type = 'decision' AND et.entity_id = decision.id
+       LEFT JOIN links link ON et.entity_type = 'link' AND et.entity_id = link.id
+       WHERE COALESCE(task.project_id, idea.project_id, note.project_id, decision.project_id, link.project_id) = ?
+         AND COALESCE(task.is_deleted, idea.is_deleted, note.is_deleted, decision.is_deleted, link.is_deleted, 0) = 0
+       ORDER BY tg.name`,
+    )
+    .bind(projectId)
+    .all();
+  return results;
 }
 
 export async function createTask(db, { projectId, text, authorId = null, source = "web" }) {
@@ -185,7 +274,7 @@ export async function createTask(db, { projectId, text, authorId = null, source 
   return task;
 }
 
-export async function updateTaskStatus(db, { taskId, projectId, status, userId }) {
+export async function updateTaskStatus(db, { taskId, projectId, status, userId, source = "web" }) {
   if (!TASK_STATUSES.includes(status)) {
     throw new Error("Некорректный статус задачи");
   }
@@ -207,7 +296,7 @@ export async function updateTaskStatus(db, { taskId, projectId, status, userId }
     action: "task.status_changed",
     entityType: "task",
     entityId: taskId,
-    details: { project_id: projectId, old_status: existing.status, new_status: status, source: "web" },
+    details: { project_id: projectId, old_status: existing.status, new_status: status, source },
   });
 }
 
@@ -359,24 +448,52 @@ export async function softDeleteLink(db, { linkId, projectId, userId }) {
   });
 }
 
-export async function searchProject(db, projectId, query) {
+export async function searchProject(db, projectId, query, filters = {}) {
   const cleanQuery = query.trim();
   if (!cleanQuery) {
     return [];
   }
 
+  const tagFilter = (alias, entityType) =>
+    filters.tag
+      ? ` AND EXISTS (
+        SELECT 1 FROM entity_tags et
+        JOIN tags tg ON tg.id = et.tag_id
+        WHERE et.entity_type = '${entityType}' AND et.entity_id = ${alias}.id AND tg.name = ?
+      )`
+      : "";
   const like = `%${cleanQuery}%`;
   const [ideas, tasks, links, notes, decisions] = await Promise.all([
-    db.prepare("SELECT id, text FROM ideas WHERE project_id = ? AND is_deleted = 0 AND text LIKE ? LIMIT 10").bind(projectId, like).all(),
-    db.prepare("SELECT id, text FROM tasks WHERE project_id = ? AND is_deleted = 0 AND text LIKE ? LIMIT 10").bind(projectId, like).all(),
     db
       .prepare(
-        "SELECT id, COALESCE(url, '') || ' ' || COALESCE(description, '') AS text FROM links WHERE project_id = ? AND is_deleted = 0 AND (COALESCE(url, '') || ' ' || COALESCE(description, '')) LIKE ? LIMIT 10",
+        `SELECT i.id, i.text FROM ideas i WHERE i.project_id = ? AND i.is_deleted = 0 AND i.text LIKE ?${tagFilter("i", "idea")} LIMIT 10`,
       )
-      .bind(projectId, like)
+      .bind(...(filters.tag ? [projectId, like, filters.tag] : [projectId, like]))
       .all(),
-    db.prepare("SELECT id, text FROM notes WHERE project_id = ? AND is_deleted = 0 AND text LIKE ? LIMIT 10").bind(projectId, like).all(),
-    db.prepare("SELECT id, text FROM decisions WHERE project_id = ? AND is_deleted = 0 AND text LIKE ? LIMIT 10").bind(projectId, like).all(),
+    db
+      .prepare(
+        `SELECT t.id, t.text FROM tasks t WHERE t.project_id = ? AND t.is_deleted = 0 AND t.text LIKE ?${tagFilter("t", "task")} LIMIT 10`,
+      )
+      .bind(...(filters.tag ? [projectId, like, filters.tag] : [projectId, like]))
+      .all(),
+    db
+      .prepare(
+        `SELECT l.id, COALESCE(l.url, '') || ' ' || COALESCE(l.description, '') AS text FROM links l WHERE l.project_id = ? AND l.is_deleted = 0 AND (COALESCE(l.url, '') || ' ' || COALESCE(l.description, '')) LIKE ?${tagFilter("l", "link")} LIMIT 10`,
+      )
+      .bind(...(filters.tag ? [projectId, like, filters.tag] : [projectId, like]))
+      .all(),
+    db
+      .prepare(
+        `SELECT n.id, n.text FROM notes n WHERE n.project_id = ? AND n.is_deleted = 0 AND n.text LIKE ?${tagFilter("n", "note")} LIMIT 10`,
+      )
+      .bind(...(filters.tag ? [projectId, like, filters.tag] : [projectId, like]))
+      .all(),
+    db
+      .prepare(
+        `SELECT d.id, d.text FROM decisions d WHERE d.project_id = ? AND d.is_deleted = 0 AND d.text LIKE ?${tagFilter("d", "decision")} LIMIT 10`,
+      )
+      .bind(...(filters.tag ? [projectId, like, filters.tag] : [projectId, like]))
+      .all(),
   ]);
 
   return [
@@ -388,12 +505,24 @@ export async function searchProject(db, projectId, query) {
   ];
 }
 
-export async function listUsers(db) {
-  const { results } = await db
-    .prepare(
-      "SELECT id, username, role, telegram_id, display_name, is_active, last_login_at, created_at, updated_at FROM users ORDER BY username",
-    )
-    .all();
+export async function listUsers(db, filters = {}) {
+  const conditions = [];
+  const bindings = [];
+  if (filters.role) {
+    conditions.push("role = ?");
+    bindings.push(filters.role);
+  }
+  if (filters.active === "1" || filters.active === "0") {
+    conditions.push("is_active = ?");
+    bindings.push(Number(filters.active));
+  }
+  const statement = db.prepare(
+    `SELECT id, username, role, telegram_id, display_name, is_active, last_login_at, created_at, updated_at
+     FROM users
+     ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
+     ORDER BY username`,
+  );
+  const { results } = await bindOptional(statement, bindings).all();
   return results;
 }
 
@@ -404,16 +533,75 @@ export async function getUser(db, userId) {
     .first();
 }
 
-export async function listAudit(db, limit = 100) {
+export async function listAudit(db, filters = {}, limit = 100) {
+  const conditions = [];
+  const bindings = [];
+  if (filters.userId) {
+    conditions.push("a.user_id = ?");
+    bindings.push(filters.userId);
+  }
+  if (filters.action) {
+    conditions.push("a.action LIKE ?");
+    bindings.push(`%${filters.action}%`);
+  }
+  if (filters.entityType) {
+    conditions.push("a.entity_type = ?");
+    bindings.push(filters.entityType);
+  }
   const { results } = await db
     .prepare(
       `SELECT a.id, a.user_id, COALESCE(u.display_name, u.username, '—') AS username, a.action, a.entity_type, a.entity_id, a.details_json, a.created_at
        FROM audit_log a
        LEFT JOIN users u ON u.id = a.user_id
+       ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
        ORDER BY a.created_at DESC
        LIMIT ?`,
     )
-    .bind(limit)
+    .bind(...bindings, limit)
     .all();
   return results;
+}
+
+export async function listDeletedEntities(db) {
+  const { results } = await db
+    .prepare(
+      `SELECT 'task' AS entity_type, t.id, t.project_id, p.name AS project_name, t.text AS title, t.deleted_at, ${authorSelect()}
+       FROM tasks t LEFT JOIN users u ON u.id = t.author_id JOIN projects p ON p.id = t.project_id WHERE t.is_deleted = 1
+       UNION ALL
+       SELECT 'idea', i.id, i.project_id, p.name, i.text, i.deleted_at, ${authorSelect()}
+       FROM ideas i LEFT JOIN users u ON u.id = i.author_id JOIN projects p ON p.id = i.project_id WHERE i.is_deleted = 1
+       UNION ALL
+       SELECT 'note', n.id, n.project_id, p.name, n.text, n.deleted_at, ${authorSelect()}
+       FROM notes n LEFT JOIN users u ON u.id = n.author_id JOIN projects p ON p.id = n.project_id WHERE n.is_deleted = 1
+       UNION ALL
+       SELECT 'decision', d.id, d.project_id, p.name, d.text, d.deleted_at, ${authorSelect()}
+       FROM decisions d LEFT JOIN users u ON u.id = d.author_id JOIN projects p ON p.id = d.project_id WHERE d.is_deleted = 1
+       UNION ALL
+       SELECT 'link', l.id, l.project_id, p.name, COALESCE(l.url, '') || ' ' || COALESCE(l.description, ''), l.deleted_at, ${authorSelect()}
+       FROM links l LEFT JOIN users u ON u.id = l.author_id JOIN projects p ON p.id = l.project_id WHERE l.is_deleted = 1
+       ORDER BY deleted_at DESC
+       LIMIT 200`,
+    )
+    .all();
+  return results;
+}
+
+export async function restoreEntity(db, { entityType, entityId, userId }) {
+  const table = ENTITY_TABLE_BY_TYPE[entityType];
+  if (!table) {
+    throw new Error("Некорректный тип записи");
+  }
+  const existing = await db.prepare(`SELECT id, project_id FROM ${table} WHERE id = ? AND is_deleted = 1`).bind(entityId).first();
+  if (!existing) {
+    throw new Error("Удалённая запись не найдена");
+  }
+  await db.prepare(`UPDATE ${table} SET is_deleted = 0, deleted_at = NULL, updated_at = datetime('now') WHERE id = ?`).bind(entityId).run();
+  await auditLog(db, {
+    userId,
+    action: `${entityType}.restored`,
+    entityType,
+    entityId,
+    details: { project_id: existing.project_id, source: "web" },
+  });
+  return existing;
 }

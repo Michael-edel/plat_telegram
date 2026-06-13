@@ -1,20 +1,18 @@
 import {
   TASK_STATUSES,
   commandPayload,
-  extractHashtags,
   isValidUrl,
   parseAllowedUsers,
   truncateText,
 } from "./utils.js";
 import { handleWebRequest } from "./web.js";
 import {
-  auditLog,
   createLink,
   createTask,
   createTextEntity as createRepositoryTextEntity,
   findUserByTelegramId,
   getOrCreateProject,
-  saveTags,
+  updateTaskStatus,
 } from "./repository.js";
 
 function json(data, init = {}) {
@@ -108,7 +106,13 @@ async function handleStart(env, message) {
       "/idea текст - сохранить идею",
       "/task текст - создать задачу",
       "/tasks - список задач",
+      "/task_doing id - перевести задачу в doing",
+      "/task_review id - перевести задачу в review",
       "/task_done id - завершить задачу",
+      "/ideas - список идей",
+      "/notes - список заметок",
+      "/decisions - список решений",
+      "/links - список ссылок",
       "/note текст - сохранить заметку",
       "/decision текст - зафиксировать решение",
       "/link url описание - сохранить ссылку",
@@ -146,7 +150,7 @@ async function handleIdea(env, message, user) {
   const project = await requireActiveProject(env, message);
   if (!project) return;
   const idea = await createTextEntity(env, "ideas", "idea", project.id, text, user?.id || null);
-  await sendMessage(env, message.chat.id, `Идея сохранена: #${idea.id}`);
+  await sendMessage(env, message.chat.id, `Идея #${idea.id} сохранена в проекте ${project.name}. Автор: ${user?.username || message.from.username || message.from.first_name || "—"}`);
 }
 
 async function handleTask(env, message, user) {
@@ -163,7 +167,7 @@ async function handleTask(env, message, user) {
     authorId: user?.id || null,
     source: "telegram",
   });
-  await sendMessage(env, message.chat.id, `Задача создана: #${task.id}`);
+  await sendMessage(env, message.chat.id, `Задача #${task.id} создана в проекте ${project.name}. Статус: todo. Автор: ${user?.username || message.from.username || message.from.first_name || "—"}`);
 }
 
 async function handleTasks(env, message) {
@@ -184,34 +188,34 @@ async function handleTasks(env, message) {
   await sendMessage(env, message.chat.id, lines.join("\n"));
 }
 
-async function handleTaskDone(env, message, user) {
+async function handleTaskStatusCommand(env, message, user, status, commandName) {
   const payload = commandPayload(message);
   const taskId = Number.parseInt(payload, 10);
   if (!Number.isInteger(taskId)) {
-    await sendMessage(env, message.chat.id, "Укажите id задачи: /task_done 1");
+    await sendMessage(env, message.chat.id, `Укажите id задачи: /${commandName} 1`);
     return;
   }
 
   const project = await requireActiveProject(env, message);
   if (!project) return;
 
-  const result = await env.DB
-    .prepare("UPDATE tasks SET status = 'done', updated_at = datetime('now') WHERE id = ? AND project_id = ? AND is_deleted = 0")
-    .bind(taskId, project.id)
-    .run();
-
-  if (!result.meta.changes) {
+  try {
+    await updateTaskStatus(env.DB, {
+      taskId,
+      projectId: project.id,
+      status,
+      userId: user?.id || null,
+      source: "telegram",
+    });
+  } catch {
     await sendMessage(env, message.chat.id, "Задача не найдена в текущем проекте.");
     return;
   }
-  await auditLog(env.DB, {
-    userId: user?.id || null,
-    action: "task.status_changed",
-    entityType: "task",
-    entityId: taskId,
-    details: { project_id: project.id, new_status: "done", source: "telegram" },
-  });
-  await sendMessage(env, message.chat.id, `Задача #${taskId} завершена.`);
+  await sendMessage(env, message.chat.id, `Задача #${taskId} в проекте ${project.name}: статус ${status}.`);
+}
+
+async function handleTaskDone(env, message, user) {
+  await handleTaskStatusCommand(env, message, user, "done", "task_done");
 }
 
 async function handleNote(env, message, user) {
@@ -223,7 +227,7 @@ async function handleNote(env, message, user) {
   const project = await requireActiveProject(env, message);
   if (!project) return;
   const note = await createTextEntity(env, "notes", "note", project.id, text, user?.id || null);
-  await sendMessage(env, message.chat.id, `Заметка сохранена: #${note.id}`);
+  await sendMessage(env, message.chat.id, `Заметка #${note.id} сохранена в проекте ${project.name}. Автор: ${user?.username || message.from.username || message.from.first_name || "—"}`);
 }
 
 async function handleDecision(env, message, user) {
@@ -235,7 +239,7 @@ async function handleDecision(env, message, user) {
   const project = await requireActiveProject(env, message);
   if (!project) return;
   const decision = await createTextEntity(env, "decisions", "decision", project.id, text, user?.id || null);
-  await sendMessage(env, message.chat.id, `Решение сохранено: #${decision.id}`);
+  await sendMessage(env, message.chat.id, `Решение #${decision.id} сохранено в проекте ${project.name}. Автор: ${user?.username || message.from.username || message.from.first_name || "—"}`);
 }
 
 async function handleLink(env, message, user) {
@@ -261,7 +265,30 @@ async function handleLink(env, message, user) {
     authorId: user?.id || null,
     source: "telegram",
   });
-  await sendMessage(env, message.chat.id, `Ссылка сохранена: #${link.id}`);
+  await sendMessage(env, message.chat.id, `Ссылка #${link.id} сохранена в проекте ${project.name}. Автор: ${user?.username || message.from.username || message.from.first_name || "—"}`);
+}
+
+async function handleEntityList(env, message, table, label) {
+  const project = await requireActiveProject(env, message);
+  if (!project) return;
+
+  const textColumn = table === "links" ? "COALESCE(url, '') || CASE WHEN description IS NULL OR description = '' THEN '' ELSE ' - ' || description END" : "text";
+  const { results } = await env.DB
+    .prepare(
+      `SELECT id, ${textColumn} AS text
+       FROM ${table}
+       WHERE project_id = ? AND is_deleted = 0
+       ORDER BY created_at DESC
+       LIMIT 30`,
+    )
+    .bind(project.id)
+    .all();
+
+  if (!results.length) {
+    await sendMessage(env, message.chat.id, `${label} в проекте ${project.name} пока нет.`);
+    return;
+  }
+  await sendMessage(env, message.chat.id, `${label} проекта ${project.name}:\n${results.map((row) => `#${row.id} ${row.text}`).join("\n")}`);
 }
 
 async function searchTable(db, table, kind, projectId, query) {
@@ -331,8 +358,26 @@ async function handleTelegramUpdate(env, update) {
     case "/tasks":
       await handleTasks(env, message);
       break;
+    case "/task_doing":
+      await handleTaskStatusCommand(env, message, user, "doing", "task_doing");
+      break;
+    case "/task_review":
+      await handleTaskStatusCommand(env, message, user, "review", "task_review");
+      break;
     case "/task_done":
       await handleTaskDone(env, message, user);
+      break;
+    case "/ideas":
+      await handleEntityList(env, message, "ideas", "Идеи");
+      break;
+    case "/notes":
+      await handleEntityList(env, message, "notes", "Заметки");
+      break;
+    case "/decisions":
+      await handleEntityList(env, message, "decisions", "Решения");
+      break;
+    case "/links":
+      await handleEntityList(env, message, "links", "Ссылки");
       break;
     case "/note":
       await handleNote(env, message, user);
