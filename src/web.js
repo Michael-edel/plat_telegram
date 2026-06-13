@@ -1,4 +1,5 @@
 import {
+  ROLES,
   WRITE_ROLES,
   appendSetCookie,
   clearSessionCookie,
@@ -21,8 +22,10 @@ import {
   getOrCreateProject,
   getProject,
   getUser,
+  listAssignableUsers,
   listAudit,
   listDeletedEntities,
+  listProjectChanges,
   listProjectAuthors,
   listProjectTags,
   listProjects,
@@ -33,7 +36,9 @@ import {
   softDeleteLink,
   softDeleteTask,
   softDeleteTextEntity,
+  TASK_PRIORITIES,
   updateLink,
+  updateTaskMeta,
   updateTaskStatus,
   updateTaskText,
   updateTextEntity,
@@ -66,6 +71,16 @@ function json(data, init = {}) {
   });
 }
 
+function textResponse(body, contentType, init = {}) {
+  return new Response(body, {
+    ...init,
+    headers: {
+      "content-type": contentType,
+      ...(init.headers || {}),
+    },
+  });
+}
+
 function redirect(location, headers = new Headers()) {
   headers.set("location", location);
   return new Response(null, { status: 303, headers });
@@ -78,6 +93,15 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function csvValue(value) {
+  return `"${String(value ?? "").replaceAll('"', '""')}"`;
+}
+
+function projectFileName(project, extension) {
+  const safeName = String(project.name || "project").replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "") || "project";
+  return `${safeName}.${extension}`;
 }
 
 function formatDate(value) {
@@ -94,6 +118,10 @@ function canWrite(user) {
 
 function isAdmin(user) {
   return requireRole(user, ["admin"]);
+}
+
+function canManageProjects(user) {
+  return requireRole(user, ["admin", "manager"]);
 }
 
 function forbiddenResponse(isApi) {
@@ -228,6 +256,7 @@ function renderLayout({ title, content, user, csrfToken }) {
     .badge { display: inline-flex; align-items: center; border-radius: 999px; padding: 2px 8px; font-size: 12px; background: #e5e7eb; color: #111827; }
     .tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
     .role-admin { background: #fee4e2; color: #912018; }
+    .role-manager { background: #fef3c7; color: #92400e; }
     .role-editor { background: #dbeafe; color: #1e3a8a; }
     .role-viewer { background: #dcfce7; color: #14532d; }
     table { width: 100%; border-collapse: collapse; }
@@ -388,7 +417,7 @@ function renderDashboard(projects, user, csrfToken) {
         .join("")
     : `<p class="muted">Проектов пока нет.</p>`;
 
-  const createPanel = isAdmin(user)
+  const createPanel = canManageProjects(user)
     ? `<section class="panel">
         <h2>Создать проект</h2>
         <form class="compact" method="post" action="/app/projects">
@@ -397,7 +426,7 @@ function renderDashboard(projects, user, csrfToken) {
           <button type="submit">Создать</button>
         </form>
       </section>`
-    : `<section class="panel"><h2>Создание проекта</h2><p class="muted">Доступно только admin.</p></section>`;
+    : `<section class="panel"><h2>Создание проекта</h2><p class="muted">Доступно только admin и manager.</p></section>`;
 
   return `<div class="topbar">
       <div><h1>Проекты</h1><p class="muted">Рабочая панель проектной базы.</p></div>
@@ -422,16 +451,38 @@ function entityMeta(item) {
   return `<div class="muted">Автор: ${escapeHtml(item.author_name || "—")} · Создано: ${escapeHtml(formatDate(item.created_at))} · Обновлено: ${escapeHtml(formatDate(item.updated_at))}</div>`;
 }
 
-function renderTask(task, projectId, user, csrfToken) {
+function assigneeName(task) {
+  return task.assignee_display_name || task.assignee_username || "";
+}
+
+function renderAssigneeOptions(assignableUsers, currentId = "") {
+  return [{ id: "", username: "Без ответственного" }, ...assignableUsers]
+    .map((item) => {
+      const name = item.display_name || item.username;
+      return `<option value="${item.id}" ${selected(item.id, currentId)}>${escapeHtml(name)}</option>`;
+    })
+    .join("");
+}
+
+function renderTask(task, projectId, user, csrfToken, assignableUsers) {
   const options = ["todo", "doing", "review", "done"]
     .map((status) => `<option value="${status}" ${task.status === status ? "selected" : ""}>${status}</option>`)
     .join("");
+  const priorityOptions = TASK_PRIORITIES.map((priority) => `<option value="${priority}" ${selected(priority, task.priority)}>${priority}</option>`).join("");
   const actions = canWrite(user)
     ? `<form class="inline-form" method="post" action="/app/tasks/${task.id}/status">
         <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
         <input type="hidden" name="project_id" value="${projectId}">
         <select name="status">${options}</select>
         <button class="secondary" type="submit">OK</button>
+      </form>
+      <form class="compact" method="post" action="/app/tasks/${task.id}/meta">
+        <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+        <input type="hidden" name="project_id" value="${projectId}">
+        <select name="priority">${priorityOptions}</select>
+        <input name="due_date" type="date" value="${escapeHtml(task.due_date || "")}">
+        <select name="assignee_id">${renderAssigneeOptions(assignableUsers, task.assignee_id || "")}</select>
+        <button class="secondary" type="submit">Поля</button>
       </form>
       <form class="compact" method="post" action="/app/tasks/${task.id}/edit">
         <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
@@ -448,6 +499,7 @@ function renderTask(task, projectId, user, csrfToken) {
   return `<article class="task">
     <div>#${task.id} ${escapeHtml(task.text)}</div>
     ${renderTags(task.tags)}
+    <div class="muted">Приоритет: ${escapeHtml(task.priority || "normal")} · Дедлайн: ${escapeHtml(task.due_date || "—")} · Ответственный: ${escapeHtml(assigneeName(task) || "—")}</div>
     ${entityMeta(task)}
     <div class="task-footer">${actions}</div>
   </article>`;
@@ -516,7 +568,25 @@ function renderSearchResults(results, query) {
     .join("")}</div>`;
 }
 
-function renderCreateForms(projectId, user, csrfToken) {
+function renderChangeLog(rows) {
+  if (!rows.length) {
+    return `<p class="muted">Истории изменений пока нет.</p>`;
+  }
+  return `<table><thead><tr><th>Дата</th><th>Кто</th><th>Сущность</th><th>Поле</th><th>Было</th><th>Стало</th></tr></thead><tbody>${rows
+    .map(
+      (row) => `<tr>
+        <td>${escapeHtml(formatDate(row.created_at))}</td>
+        <td>${escapeHtml(row.username || "—")}</td>
+        <td>${escapeHtml(row.entity_type)} #${row.entity_id}</td>
+        <td>${escapeHtml(row.field_name)}</td>
+        <td>${escapeHtml(row.old_value || "—")}</td>
+        <td>${escapeHtml(row.new_value || "—")}</td>
+      </tr>`,
+    )
+    .join("")}</tbody></table>`;
+}
+
+function renderCreateForms(projectId, user, csrfToken, assignableUsers) {
   if (!canWrite(user)) {
     return `<section class="panel"><h2>Добавить запись</h2><p class="muted">У вашей роли доступ только на чтение.</p></section>`;
   }
@@ -527,6 +597,9 @@ function renderCreateForms(projectId, user, csrfToken) {
         <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
         <input type="hidden" name="project_id" value="${projectId}">
         <textarea name="text" placeholder="Новая задача" required></textarea>
+        <select name="priority">${TASK_PRIORITIES.map((priority) => `<option value="${priority}" ${selected(priority, "normal")}>${priority}</option>`).join("")}</select>
+        <input name="due_date" type="date">
+        <select name="assignee_id">${renderAssigneeOptions(assignableUsers)}</select>
         <button type="submit">Создать задачу</button>
       </form>
       ${Object.entries(ENTITY_PATHS)
@@ -564,13 +637,13 @@ function renderProject(project, data, searchResults, filters, filterOptions, use
   const taskColumns = ["todo", "doing", "review", "done"]
     .map((status) => {
       const tasks = data.tasks.filter((task) => task.status === status);
-      return `<section class="column"><h3>${status}</h3>${tasks.length ? tasks.map((task) => renderTask(task, project.id, user, csrfToken)).join("") : `<p class="muted">Нет задач.</p>`}</section>`;
+      return `<section class="column"><h3>${status}</h3>${tasks.length ? tasks.map((task) => renderTask(task, project.id, user, csrfToken, filterOptions.assignableUsers)).join("") : `<p class="muted">Нет задач.</p>`}</section>`;
     })
     .join("");
 
   return `<div class="topbar">
       <div><h1>${escapeHtml(project.name)}</h1><p class="muted">Создан: ${escapeHtml(formatDate(project.created_at))}</p></div>
-      <a class="button secondary" href="/app">Все проекты</a>
+      <div class="inline-form"><a class="button secondary" href="/app">Все проекты</a><a class="button secondary" href="/app/projects/${project.id}/export.md">Markdown</a><a class="button secondary" href="/app/projects/${project.id}/export.csv">CSV</a><a class="button secondary" href="/app/projects/${project.id}/export.json">JSON</a></div>
     </div>
     <section class="panel" id="search">
       <h2>Фильтры и поиск</h2>
@@ -587,6 +660,7 @@ function renderProject(project, data, searchResults, filters, filterOptions, use
     <div class="grid two" style="margin-top:16px">
       <div class="grid">
         <section class="panel" id="tasks"><h2>Задачи</h2><div class="columns">${taskColumns}</div></section>
+        <section class="panel" id="changes"><h2>История изменений</h2>${renderChangeLog(filterOptions.changes)}</section>
         <div class="section-grid">
           <section class="panel" id="ideas"><h2>Идеи</h2><div class="items">${renderTextCards(data.ideas, "ideas", project.id, user, csrfToken)}</div></section>
           <section class="panel" id="notes"><h2>Заметки</h2><div class="items">${renderTextCards(data.notes, "notes", project.id, user, csrfToken)}</div></section>
@@ -594,7 +668,7 @@ function renderProject(project, data, searchResults, filters, filterOptions, use
           <section class="panel" id="links"><h2>Ссылки</h2><div class="items">${renderLinks(data.links, project.id, user, csrfToken)}</div></section>
         </div>
       </div>
-      ${renderCreateForms(project.id, user, csrfToken)}
+      ${renderCreateForms(project.id, user, csrfToken, filterOptions.assignableUsers)}
     </div>`;
 }
 
@@ -612,7 +686,7 @@ function renderUsersPage(users, filters, csrfToken) {
           <form class="inline-form" method="post" action="/app/users/${user.id}/role">
             <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
             <select name="role">
-              ${["admin", "editor", "viewer"].map((role) => `<option value="${role}" ${user.role === role ? "selected" : ""}>${role}</option>`).join("")}
+              ${ROLES.map((role) => `<option value="${role}" ${user.role === role ? "selected" : ""}>${role}</option>`).join("")}
             </select>
             <button class="secondary">Роль</button>
           </form>
@@ -637,7 +711,7 @@ function renderUsersPage(users, filters, csrfToken) {
       <form class="filters" method="get" action="/app/users">
         <label>Роль<select name="role">
           <option value="">Все роли</option>
-          ${["admin", "editor", "viewer"].map((role) => `<option value="${role}" ${selected(role, filters.role)}>${role}</option>`).join("")}
+          ${ROLES.map((role) => `<option value="${role}" ${selected(role, filters.role)}>${role}</option>`).join("")}
         </select></label>
         <label>Статус<select name="active">
           <option value="">Все</option>
@@ -660,7 +734,7 @@ function renderUsersPage(users, filters, csrfToken) {
           <input name="username" placeholder="Логин" required>
           <input name="display_name" placeholder="Имя">
           <input name="telegram_id" placeholder="Telegram ID">
-          <select name="role"><option value="viewer">viewer</option><option value="editor">editor</option><option value="admin">admin</option></select>
+          <select name="role">${ROLES.map((role) => `<option value="${role}">${role}</option>`).join("")}</select>
           <input name="password" type="password" placeholder="Пароль" required>
           <button type="submit">Создать</button>
         </form>
@@ -726,6 +800,60 @@ function renderDeletedPage(rows, csrfToken) {
     </section>`;
 }
 
+function projectMarkdown(project, data) {
+  const lines = [`# ${project.name}`, "", `Создан: ${formatDate(project.created_at)}`, "", "## Задачи"];
+  for (const task of data.tasks) {
+    lines.push(
+      `- [${task.status}] #${task.id} ${task.text} (priority: ${task.priority || "normal"}, due: ${task.due_date || "-"}, assignee: ${assigneeName(task) || "-"})`,
+    );
+  }
+  for (const [title, items, formatter] of [
+    ["Идеи", data.ideas, (item) => `#${item.id} ${item.text}`],
+    ["Заметки", data.notes, (item) => `#${item.id} ${item.text}`],
+    ["Решения", data.decisions, (item) => `#${item.id} ${item.text}`],
+    ["Ссылки", data.links, (item) => `#${item.id} ${item.url}${item.description ? ` - ${item.description}` : ""}`],
+  ]) {
+    lines.push("", `## ${title}`);
+    lines.push(...(items.length ? items.map((item) => `- ${formatter(item)}`) : ["-"]));
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function projectCsv(project, data) {
+  const rows = [["project", "type", "id", "status", "priority", "due_date", "assignee", "text", "url", "created_at", "updated_at"]];
+  for (const task of data.tasks) {
+    rows.push([project.name, "task", task.id, task.status, task.priority, task.due_date, assigneeName(task), task.text, "", task.created_at, task.updated_at]);
+  }
+  for (const [type, items] of [
+    ["idea", data.ideas],
+    ["note", data.notes],
+    ["decision", data.decisions],
+  ]) {
+    for (const item of items) rows.push([project.name, type, item.id, "", "", "", item.author_name, item.text, "", item.created_at, item.updated_at]);
+  }
+  for (const item of data.links) {
+    rows.push([project.name, "link", item.id, "", "", "", item.author_name, item.description || "", item.url, item.created_at, item.updated_at]);
+  }
+  return `${rows.map((row) => row.map(csvValue).join(",")).join("\n")}\n`;
+}
+
+async function handleProjectExport(env, user, projectId, format) {
+  const project = await getProject(env.DB, projectId);
+  if (!project) return renderErrorPage("Проект не найден", 404);
+  const data = await loadProjectData(env.DB, projectId);
+  const headers = new Headers();
+  if (format === "json") {
+    headers.set("content-disposition", `attachment; filename="${projectFileName(project, "json")}"`);
+    return json({ project, data }, { headers });
+  }
+  if (format === "csv") {
+    headers.set("content-disposition", `attachment; filename="${projectFileName(project, "csv")}"`);
+    return textResponse(projectCsv(project, data), "text/csv; charset=utf-8", { headers });
+  }
+  headers.set("content-disposition", `attachment; filename="${projectFileName(project, "md")}"`);
+  return textResponse(projectMarkdown(project, data), "text/markdown; charset=utf-8", { headers });
+}
+
 async function handleLogin(request, env) {
   const data = await readRequestData(request);
   if (!(await verifyCsrfToken(request, env, data.csrf_token))) {
@@ -776,22 +904,24 @@ async function handleProjectPage(env, request, user, projectId) {
   if (!project) return renderErrorPage("Проект не найден", 404);
   const url = new URL(request.url);
   const filters = projectFilterParams(url);
-  const [data, searchResults, authors, tags] = await Promise.all([
+  const [data, searchResults, authors, tags, assignableUsers, changes] = await Promise.all([
     loadProjectData(env.DB, project.id, filters),
     filters.q ? searchProject(env.DB, project.id, filters.q, filters) : Promise.resolve([]),
     listProjectAuthors(env.DB, project.id),
     listProjectTags(env.DB, project.id),
+    listAssignableUsers(env.DB),
+    listProjectChanges(env.DB, project.id),
   ]);
   const csrfToken = await createCsrfToken(env);
   const headers = new Headers();
   appendSetCookie(headers, createCsrfCookie(csrfToken));
-  return html(renderLayout({ title: project.name, content: renderProject(project, data, searchResults, filters, { authors, tags }, user, csrfToken), user, csrfToken }), {
+  return html(renderLayout({ title: project.name, content: renderProject(project, data, searchResults, filters, { authors, tags, assignableUsers, changes }, user, csrfToken), user, csrfToken }), {
     headers,
   });
 }
 
 async function handleCreateProject(env, request, user) {
-  if (!isAdmin(user)) return forbiddenResponse(false);
+  if (!canManageProjects(user)) return forbiddenResponse(false);
   const data = await readRequestData(request);
   await requireCsrf(request, env, data);
   const project = await getOrCreateProject(env.DB, String(data.name || ""), user.id, "web");
@@ -803,7 +933,15 @@ async function handleCreateTask(env, request, user) {
   const data = await readRequestData(request);
   await requireCsrf(request, env, data);
   const projectId = Number.parseInt(data.project_id, 10);
-  await createTask(env.DB, { projectId, text: String(data.text || ""), authorId: user.id, source: "web" });
+  await createTask(env.DB, {
+    projectId,
+    text: String(data.text || ""),
+    authorId: user.id,
+    source: "web",
+    priority: String(data.priority || "normal"),
+    dueDate: String(data.due_date || ""),
+    assigneeId: data.assignee_id,
+  });
   return redirect(projectRedirect(projectId));
 }
 
@@ -822,6 +960,22 @@ async function handleTaskEdit(env, request, user, taskId) {
   await requireCsrf(request, env, data);
   const projectId = Number.parseInt(data.project_id, 10);
   await updateTaskText(env.DB, { taskId, projectId, text: String(data.text || ""), userId: user.id });
+  return redirect(projectRedirect(projectId));
+}
+
+async function handleTaskMeta(env, request, user, taskId) {
+  if (!canWrite(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const projectId = Number.parseInt(data.project_id, 10);
+  await updateTaskMeta(env.DB, {
+    taskId,
+    projectId,
+    priority: String(data.priority || "normal"),
+    dueDate: String(data.due_date || ""),
+    assigneeId: data.assignee_id,
+    userId: user.id,
+  });
   return redirect(projectRedirect(projectId));
 }
 
@@ -916,7 +1070,7 @@ async function handleUsersPage(env, request, user) {
   if (!isAdmin(user)) return forbiddenResponse(false);
   const url = new URL(request.url);
   const filters = {
-    role: ["admin", "editor", "viewer"].includes(url.searchParams.get("role")) ? url.searchParams.get("role") : "",
+    role: ROLES.includes(url.searchParams.get("role")) ? url.searchParams.get("role") : "",
     active: ["0", "1"].includes(url.searchParams.get("active")) ? url.searchParams.get("active") : "",
   };
   const users = await listUsers(env.DB, filters);
@@ -964,7 +1118,7 @@ async function handleCreateUser(env, request, user) {
   const username = String(data.username || "").trim();
   const password = String(data.password || "");
   const role = String(data.role || "viewer");
-  if (!username || !password || !["admin", "editor", "viewer"].includes(role)) throw new Error("Некорректные данные пользователя");
+  if (!username || !password || !ROLES.includes(role)) throw new Error("Некорректные данные пользователя");
   const passwordHash = await hashPassword(password);
   const result = await env.DB
     .prepare(
@@ -982,7 +1136,7 @@ async function handleUserRole(env, request, user, targetId) {
   await requireCsrf(request, env, data);
   const target = await getUser(env.DB, targetId);
   const role = String(data.role || "");
-  if (!target || !["admin", "editor", "viewer"].includes(role)) throw new Error("Некорректная роль");
+  if (!target || !ROLES.includes(role)) throw new Error("Некорректная роль");
   await env.DB.prepare("UPDATE users SET role = ?, updated_at = datetime('now') WHERE id = ?").bind(role, targetId).run();
   await auditLog(env.DB, {
     userId: user.id,
@@ -1060,7 +1214,7 @@ async function handleApi(env, request, url, user) {
     const username = String(data.username || "").trim();
     const password = String(data.password || "");
     const role = String(data.role || "viewer");
-    if (!username || !password || !["admin", "editor", "viewer"].includes(role)) {
+    if (!username || !password || !ROLES.includes(role)) {
       return json({ error: "Invalid user data" }, { status: 400 });
     }
     const passwordHash = await hashPassword(password);
@@ -1081,7 +1235,7 @@ async function handleApi(env, request, url, user) {
     if (adminUserAction[2] === "role") {
       const target = await getUser(env.DB, targetId);
       const role = String(data.role || "");
-      if (!target || !["admin", "editor", "viewer"].includes(role)) return json({ error: "Invalid role" }, { status: 400 });
+      if (!target || !ROLES.includes(role)) return json({ error: "Invalid role" }, { status: 400 });
       await env.DB.prepare("UPDATE users SET role = ?, updated_at = datetime('now') WHERE id = ?").bind(role, targetId).run();
       await auditLog(env.DB, {
         userId: user.id,
@@ -1118,7 +1272,7 @@ async function handleApi(env, request, url, user) {
   }
 
   if (url.pathname === "/api/projects") {
-    if (!isAdmin(user)) return forbiddenResponse(true);
+    if (!canManageProjects(user)) return forbiddenResponse(true);
     const project = await getOrCreateProject(env.DB, String(data.name || ""), user.id, "api");
     return json({ project }, { status: 201 });
   }
@@ -1129,15 +1283,28 @@ async function handleApi(env, request, url, user) {
       text: String(data.text || ""),
       authorId: user.id,
       source: "api",
+      priority: String(data.priority || "normal"),
+      dueDate: String(data.due_date || ""),
+      assigneeId: data.assignee_id,
     });
     return json({ task }, { status: 201 });
   }
 
-  const taskAction = url.pathname.match(/^\/api\/tasks\/(\d+)\/(status|edit|delete)$/);
+  const taskAction = url.pathname.match(/^\/api\/tasks\/(\d+)\/(status|meta|edit|delete)$/);
   if (taskAction) {
     const taskId = Number.parseInt(taskAction[1], 10);
     const projectId = Number.parseInt(data.project_id, 10);
     if (taskAction[2] === "status") await updateTaskStatus(env.DB, { taskId, projectId, status: String(data.status || ""), userId: user.id });
+    if (taskAction[2] === "meta") {
+      await updateTaskMeta(env.DB, {
+        taskId,
+        projectId,
+        priority: String(data.priority || "normal"),
+        dueDate: String(data.due_date || ""),
+        assigneeId: data.assignee_id,
+        userId: user.id,
+      });
+    }
     if (taskAction[2] === "edit") await updateTaskText(env.DB, { taskId, projectId, text: String(data.text || ""), userId: user.id });
     if (taskAction[2] === "delete") await softDeleteTask(env.DB, { taskId, projectId, userId: user.id });
     return json({ ok: true });
@@ -1230,6 +1397,11 @@ export async function handleWebRequest(request, env) {
       return await handleDashboard(env, user);
     }
 
+    const exportMatch = url.pathname.match(/^\/app\/projects\/(\d+)\/export\.(json|csv|md)$/);
+    if (request.method === "GET" && exportMatch) {
+      return await handleProjectExport(env, user, Number.parseInt(exportMatch[1], 10), exportMatch[2]);
+    }
+
     const projectMatch = url.pathname.match(/^\/app\/projects\/(\d+)$/);
     if (request.method === "GET" && projectMatch) {
       return await handleProjectPage(env, request, user, Number.parseInt(projectMatch[1], 10));
@@ -1242,10 +1414,11 @@ export async function handleWebRequest(request, env) {
     if (request.method === "POST" && url.pathname === "/app/projects") return await handleCreateProject(env, request, user);
     if (request.method === "POST" && url.pathname === "/app/tasks") return await handleCreateTask(env, request, user);
 
-    const taskAction = url.pathname.match(/^\/app\/tasks\/(\d+)\/(status|edit|delete)$/);
+    const taskAction = url.pathname.match(/^\/app\/tasks\/(\d+)\/(status|meta|edit|delete)$/);
     if (request.method === "POST" && taskAction) {
       const taskId = Number.parseInt(taskAction[1], 10);
       if (taskAction[2] === "status") return await handleTaskStatus(env, request, user, taskId);
+      if (taskAction[2] === "meta") return await handleTaskMeta(env, request, user, taskId);
       if (taskAction[2] === "edit") return await handleTaskEdit(env, request, user, taskId);
       return await handleTaskDelete(env, request, user, taskId);
     }

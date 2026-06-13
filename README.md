@@ -52,6 +52,7 @@ https://bot.michael.kz/login
 Роли:
 
 - `admin` - полный доступ, пользователи, аудит, создание проектов и все рабочие действия.
+- `manager` - управление проектами, задачами, сроками, приоритетами, ответственными и рабочими записями без доступа к управлению пользователями.
 - `editor` - просмотр, создание и редактирование рабочих записей, смена статуса задач.
 - `viewer` - только просмотр и поиск.
 
@@ -62,6 +63,10 @@ https://bot.michael.kz/login
 - статистика по задачам, идеям, заметкам, решениям и ссылкам;
 - страница проекта;
 - задачи по статусам `todo`, `doing`, `review`, `done`;
+- приоритеты задач `low`, `normal`, `high`, `urgent`;
+- дедлайны задач;
+- ответственные за задачи;
+- история изменений по проекту;
 - фильтры проекта по статусу, автору и тегу;
 - поиск по проекту с учётом выбранного тега;
 - отображение тегов на карточках задач, идей, заметок, решений и ссылок;
@@ -73,6 +78,7 @@ https://bot.michael.kz/login
 - отображение `telegram_id` и `last_login_at` в пользователях;
 - аудит действий для `admin` с фильтрами по пользователю, действию и типу сущности;
 - просмотр и восстановление мягко удалённых записей для `admin`;
+- экспорт проекта в Markdown, CSV и JSON;
 - JSON API для проектов, данных проекта и поиска.
 
 Маршруты:
@@ -81,12 +87,16 @@ https://bot.michael.kz/login
 GET  /app
 GET  /app/projects
 GET  /app/projects/:id
+GET  /app/projects/:id/export.md
+GET  /app/projects/:id/export.csv
+GET  /app/projects/:id/export.json
 GET  /app/users
 GET  /app/deleted
 GET  /app/audit
 POST /app/projects
 POST /app/tasks
 POST /app/tasks/:id/status
+POST /app/tasks/:id/meta
 POST /app/tasks/:id/edit
 POST /app/tasks/:id/delete
 POST /app/ideas

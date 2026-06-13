@@ -7,6 +7,7 @@ export const ENTITY_CONFIG = {
 };
 
 export const WORK_ENTITY_TABLES = new Set(["tasks", "ideas", "notes", "decisions", "links"]);
+export const TASK_PRIORITIES = ["low", "normal", "high", "urgent"];
 
 const ENTITY_TABLE_BY_TYPE = {
   task: "tasks",
@@ -27,6 +28,32 @@ export async function auditLog(db, { userId = null, action, entityType = null, e
     )
     .bind(userId, action, entityType, entityId, detailsJson(details))
     .run();
+}
+
+export async function changeLog(db, { userId = null, entityType, entityId, fieldName, oldValue = null, newValue = null }) {
+  if (String(oldValue ?? "") === String(newValue ?? "")) {
+    return;
+  }
+  await db
+    .prepare(
+      "INSERT INTO change_log (user_id, entity_type, entity_id, field_name, old_value, new_value, created_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+    )
+    .bind(userId, entityType, entityId, fieldName, oldValue == null ? null : String(oldValue), newValue == null ? null : String(newValue))
+    .run();
+}
+
+function cleanTaskPriority(priority) {
+  return TASK_PRIORITIES.includes(priority) ? priority : "normal";
+}
+
+function cleanDate(value) {
+  const date = String(value || "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : null;
+}
+
+function cleanAssigneeId(value) {
+  const id = Number.parseInt(value || "", 10);
+  return Number.isInteger(id) && id > 0 ? id : null;
 }
 
 export async function findUserByTelegramId(db, telegramId) {
@@ -154,9 +181,11 @@ export async function loadProjectData(db, projectId, filters = {}) {
   const [tasks, ideas, notes, decisions, links] = await Promise.all([
     db
       .prepare(
-        `SELECT t.id, t.text, t.status, t.created_at, t.updated_at, t.author_id, ${authorSelect()}, ${tagsSelect("t", "task")}
+        `SELECT t.id, t.text, t.status, t.priority, t.due_date, t.assignee_id, au.display_name AS assignee_display_name, au.username AS assignee_username,
+                t.created_at, t.updated_at, t.author_id, ${authorSelect()}, ${tagsSelect("t", "task")}
          FROM tasks t
          LEFT JOIN users u ON u.id = t.author_id
+         LEFT JOIN users au ON au.id = t.assignee_id
          WHERE ${taskFilters.whereSql}
          ORDER BY t.created_at DESC`,
       )
@@ -252,16 +281,23 @@ export async function listProjectTags(db, projectId) {
   return results;
 }
 
-export async function createTask(db, { projectId, text, authorId = null, source = "web" }) {
+export async function listAssignableUsers(db) {
+  const { results } = await db
+    .prepare("SELECT id, username, display_name, role FROM users WHERE is_active = 1 AND role IN ('admin', 'manager', 'editor') ORDER BY username")
+    .all();
+  return results;
+}
+
+export async function createTask(db, { projectId, text, authorId = null, source = "web", priority = "normal", dueDate = null, assigneeId = null }) {
   const cleanText = text.trim();
   if (!cleanText) {
     throw new Error("Текст задачи не может быть пустым");
   }
   const task = await db
     .prepare(
-      "INSERT INTO tasks (project_id, text, status, author_id, created_at, updated_at) VALUES (?, ?, 'todo', ?, datetime('now'), datetime('now')) RETURNING *",
+      "INSERT INTO tasks (project_id, text, status, author_id, priority, due_date, assignee_id, created_at, updated_at) VALUES (?, ?, 'todo', ?, ?, ?, ?, datetime('now'), datetime('now')) RETURNING *",
     )
-    .bind(projectId, cleanText, authorId)
+    .bind(projectId, cleanText, authorId, cleanTaskPriority(priority), cleanDate(dueDate), cleanAssigneeId(assigneeId))
     .first();
   await saveTags(db, "task", task.id, cleanText);
   await auditLog(db, {
@@ -298,6 +334,14 @@ export async function updateTaskStatus(db, { taskId, projectId, status, userId, 
     entityId: taskId,
     details: { project_id: projectId, old_status: existing.status, new_status: status, source },
   });
+  await changeLog(db, {
+    userId,
+    entityType: "task",
+    entityId: taskId,
+    fieldName: "status",
+    oldValue: existing.status,
+    newValue: status,
+  });
 }
 
 export async function updateTaskText(db, { taskId, projectId, text, userId }) {
@@ -305,6 +349,14 @@ export async function updateTaskText(db, { taskId, projectId, text, userId }) {
   if (!cleanText) {
     throw new Error("Текст задачи не может быть пустым");
   }
+  const existing = await db
+    .prepare("SELECT id, text FROM tasks WHERE id = ? AND project_id = ? AND is_deleted = 0")
+    .bind(taskId, projectId)
+    .first();
+  if (!existing) {
+    throw new Error("Задача не найдена");
+  }
+
   await db
     .prepare("UPDATE tasks SET text = ?, updated_at = datetime('now') WHERE id = ? AND project_id = ? AND is_deleted = 0")
     .bind(cleanText, taskId, projectId)
@@ -316,6 +368,45 @@ export async function updateTaskText(db, { taskId, projectId, text, userId }) {
     entityType: "task",
     entityId: taskId,
     details: { project_id: projectId, source: "web" },
+  });
+  await changeLog(db, {
+    userId,
+    entityType: "task",
+    entityId: taskId,
+    fieldName: "text",
+    oldValue: existing.text,
+    newValue: cleanText,
+  });
+}
+
+export async function updateTaskMeta(db, { taskId, projectId, priority, dueDate, assigneeId, userId }) {
+  const existing = await db
+    .prepare("SELECT id, priority, due_date, assignee_id FROM tasks WHERE id = ? AND project_id = ? AND is_deleted = 0")
+    .bind(taskId, projectId)
+    .first();
+  if (!existing) {
+    throw new Error("Задача не найдена");
+  }
+
+  const nextPriority = cleanTaskPriority(priority);
+  const nextDueDate = cleanDate(dueDate);
+  const nextAssigneeId = cleanAssigneeId(assigneeId);
+  await db
+    .prepare("UPDATE tasks SET priority = ?, due_date = ?, assignee_id = ?, updated_at = datetime('now') WHERE id = ? AND project_id = ? AND is_deleted = 0")
+    .bind(nextPriority, nextDueDate, nextAssigneeId, taskId, projectId)
+    .run();
+
+  await Promise.all([
+    changeLog(db, { userId, entityType: "task", entityId: taskId, fieldName: "priority", oldValue: existing.priority, newValue: nextPriority }),
+    changeLog(db, { userId, entityType: "task", entityId: taskId, fieldName: "due_date", oldValue: existing.due_date, newValue: nextDueDate }),
+    changeLog(db, { userId, entityType: "task", entityId: taskId, fieldName: "assignee_id", oldValue: existing.assignee_id, newValue: nextAssigneeId }),
+  ]);
+  await auditLog(db, {
+    userId,
+    action: "task.meta_changed",
+    entityType: "task",
+    entityId: taskId,
+    details: { project_id: projectId, priority: nextPriority, due_date: nextDueDate, assignee_id: nextAssigneeId, source: "web" },
   });
 }
 
@@ -366,6 +457,11 @@ export async function updateTextEntity(db, { table, entityType, entityId, projec
     throw new Error("Текст не может быть пустым");
   }
 
+  const existing = await db.prepare(`SELECT id, text FROM ${table} WHERE id = ? AND project_id = ? AND is_deleted = 0`).bind(entityId, projectId).first();
+  if (!existing) {
+    throw new Error("Запись не найдена");
+  }
+
   await db
     .prepare(`UPDATE ${table} SET text = ?, updated_at = datetime('now') WHERE id = ? AND project_id = ? AND is_deleted = 0`)
     .bind(cleanText, entityId, projectId)
@@ -377,6 +473,14 @@ export async function updateTextEntity(db, { table, entityType, entityId, projec
     entityType,
     entityId,
     details: { project_id: projectId, source: "web" },
+  });
+  await changeLog(db, {
+    userId,
+    entityType,
+    entityId,
+    fieldName: "text",
+    oldValue: existing.text,
+    newValue: cleanText,
   });
 }
 
@@ -420,6 +524,10 @@ export async function createLink(db, { projectId, url, description, authorId = n
 export async function updateLink(db, { linkId, projectId, url, description, userId }) {
   const cleanUrl = url.trim();
   const cleanDescription = description.trim();
+  const existing = await db.prepare("SELECT id, url, description FROM links WHERE id = ? AND project_id = ? AND is_deleted = 0").bind(linkId, projectId).first();
+  if (!existing) {
+    throw new Error("Ссылка не найдена");
+  }
   await db
     .prepare("UPDATE links SET url = ?, description = ?, updated_at = datetime('now') WHERE id = ? AND project_id = ? AND is_deleted = 0")
     .bind(cleanUrl, cleanDescription || null, linkId, projectId)
@@ -432,6 +540,10 @@ export async function updateLink(db, { linkId, projectId, url, description, user
     entityId: linkId,
     details: { project_id: projectId, source: "web" },
   });
+  await Promise.all([
+    changeLog(db, { userId, entityType: "link", entityId: linkId, fieldName: "url", oldValue: existing.url, newValue: cleanUrl }),
+    changeLog(db, { userId, entityType: "link", entityId: linkId, fieldName: "description", oldValue: existing.description, newValue: cleanDescription || null }),
+  ]);
 }
 
 export async function softDeleteLink(db, { linkId, projectId, userId }) {
@@ -558,6 +670,27 @@ export async function listAudit(db, filters = {}, limit = 100) {
        LIMIT ?`,
     )
     .bind(...bindings, limit)
+    .all();
+  return results;
+}
+
+export async function listProjectChanges(db, projectId, limit = 100) {
+  const { results } = await db
+    .prepare(
+      `SELECT c.id, c.entity_type, c.entity_id, c.field_name, c.old_value, c.new_value, c.created_at,
+              COALESCE(u.display_name, u.username, '—') AS username
+       FROM change_log c
+       LEFT JOIN users u ON u.id = c.user_id
+       LEFT JOIN tasks t ON c.entity_type = 'task' AND c.entity_id = t.id
+       LEFT JOIN ideas i ON c.entity_type = 'idea' AND c.entity_id = i.id
+       LEFT JOIN notes n ON c.entity_type = 'note' AND c.entity_id = n.id
+       LEFT JOIN decisions d ON c.entity_type = 'decision' AND c.entity_id = d.id
+       LEFT JOIN links l ON c.entity_type = 'link' AND c.entity_id = l.id
+       WHERE COALESCE(t.project_id, i.project_id, n.project_id, d.project_id, l.project_id) = ?
+       ORDER BY c.created_at DESC
+       LIMIT ?`,
+    )
+    .bind(projectId, limit)
     .all();
   return results;
 }

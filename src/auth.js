@@ -3,8 +3,8 @@ const CSRF_COOKIE = "pp_csrf";
 const SESSION_TTL_SECONDS = 60 * 60 * 12;
 const PASSWORD_ITERATIONS = 100000;
 
-export const ROLES = ["admin", "editor", "viewer"];
-export const WRITE_ROLES = ["admin", "editor"];
+export const ROLES = ["admin", "manager", "editor", "viewer"];
+export const WRITE_ROLES = ["admin", "manager", "editor"];
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -259,6 +259,7 @@ export async function getCurrentUser(request, env) {
 
 export function roleLabel(role) {
   if (role === "admin") return "admin";
+  if (role === "manager") return "manager";
   if (role === "editor") return "editor";
   return "viewer";
 }
