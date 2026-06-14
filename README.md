@@ -23,6 +23,7 @@
 - `/task_doing [id]` - перевести задачу в `doing`
 - `/task_review [id]` - перевести задачу в `review`
 - `/task_done [id]` - завершить задачу
+- `/comment [task_id] [text]` - добавить комментарий к задаче
 - `/ideas` - показать идеи текущего проекта
 - `/notes` - показать заметки текущего проекта
 - `/decisions` - показать решения текущего проекта
@@ -69,11 +70,14 @@ https://bot.michael.kz/login
 - дедлайны задач;
 - ответственные за задачи;
 - история изменений по проекту;
+- комментарии внутри задач;
+- упоминания `@username` в комментариях с Telegram-уведомлениями;
+- activity feed внутри задачи;
 - фильтры проекта по статусу, автору, ответственному, приоритету, дедлайну и тегу;
 - фильтр истории изменений по типу сущности и пользователю;
 - обзор рисков: просроченные задачи и задачи с ближайшим дедлайном;
 - расчёт дедлайнов с учётом локального часового пояса приложения;
-- поиск по проекту с учётом выбранного тега;
+- FTS5-поиск по проекту с fallback на LIKE и учётом выбранного тега;
 - отображение тегов на карточках задач, идей, заметок, решений и ссылок;
 - смена статуса задачи через select;
 - создание задач, идей, заметок, решений и ссылок;
@@ -85,7 +89,9 @@ https://bot.michael.kz/login
 - просмотр и восстановление мягко удалённых записей для `admin`;
 - экспорт проекта в Markdown, CSV и JSON;
 - Telegram-уведомления о назначении ответственного, смене статуса, ближайшем дедлайне и просрочке;
-- Telegram inline-кнопки для быстрой смены статуса задач;
+- Telegram inline-кнопки для быстрой смены статуса задач с проверкой роли пользователя;
+- deep links из Telegram в web panel: кнопка `Открыть в Web` ведёт на конкретную задачу;
+- подсветка задачи в web panel при открытии `/app/projects/:id?task=:task_id`;
 - фоновая отправка уведомлений через `ctx.waitUntil()`, чтобы веб-запросы и webhook отвечали быстрее;
 - JSON API для проектов, данных проекта и поиска.
 
@@ -107,6 +113,9 @@ POST /app/tasks/:id/status
 POST /app/tasks/:id/meta
 POST /app/tasks/:id/edit
 POST /app/tasks/:id/delete
+POST /app/tasks/:id/comments
+POST /app/comments/:id/edit
+POST /app/comments/:id/delete
 POST /app/ideas
 POST /app/ideas/:id/edit
 POST /app/ideas/:id/delete
@@ -139,9 +148,11 @@ POST /api/admin/users/:id/password
 - POST-формы защищены CSRF token;
 - `/login` ограничивает частые неудачные попытки входа по IP;
 - write routes проверяют роли на backend;
+- Telegram callback-кнопки проверяют `ALLOWED_USERS`, активного пользователя и роль `admin`/`manager`/`editor`;
 - viewer не видит кнопки создания, редактирования, удаления и смены статуса;
 - действия записываются в `audit_log`.
 - старые записи `audit_log` и `change_log` очищаются по `AUDIT_RETENTION_DAYS`.
+- FTS5-индекс синхронизируется application code; если FTS временно недоступен, основной сценарий записи не ломается.
 
 Первый admin создаётся автоматически при первом обращении к панели, если таблица `users` пустая и заданы secrets:
 
@@ -201,6 +212,7 @@ Settings -> Secrets and variables -> Actions -> New repository secret
 - `ALLOWED_USERS` - Telegram user_id через запятую, например `111111111,222222222`.
 - `WEBHOOK_SECRET` - произвольная секретная строка для проверки Telegram webhook.
 - `WEBHOOK_URL` - полный URL webhook: `https://bot.michael.kz/telegram/webhook`.
+- `APP_BASE_URL` - базовый адрес web panel для deep links: `https://bot.michael.kz`.
 - `SESSION_SECRET` - длинный секрет для подписи web sessions и CSRF.
 - `INITIAL_ADMIN_USERNAME` - логин первого admin, если `users` ещё пустая.
 - `INITIAL_ADMIN_PASSWORD` - пароль первого admin, если `users` ещё пустая.
@@ -209,7 +221,7 @@ Settings -> Secrets and variables -> Actions -> New repository secret
 - `AUDIT_RETENTION_DAYS` - сколько дней хранить аудит и историю изменений, по умолчанию `90`.
 - `TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID` - необязательный общий чат/канал для уведомлений о статусах и дедлайнах.
 
-Workflow сам загрузит `BOT_TOKEN`, `WEBHOOK_SECRET`, `ALLOWED_USERS`, `SESSION_SECRET`, `INITIAL_ADMIN_USERNAME`, `INITIAL_ADMIN_PASSWORD`, `TASK_DUE_SOON_HOURS`, `APP_TIMEZONE_OFFSET_HOURS`, `AUDIT_RETENTION_DAYS` и, если задан, `TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID` в Worker secrets через Wrangler.
+Workflow сам загрузит `BOT_TOKEN`, `WEBHOOK_SECRET`, `ALLOWED_USERS`, `APP_BASE_URL`, `SESSION_SECRET`, `INITIAL_ADMIN_USERNAME`, `INITIAL_ADMIN_PASSWORD`, `TASK_DUE_SOON_HOURS`, `APP_TIMEZONE_OFFSET_HOURS`, `AUDIT_RETENTION_DAYS` и, если задан, `TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID` в Worker secrets через Wrangler.
 
 ## Деплой через GitHub
 
@@ -220,9 +232,25 @@ Workflow `.github/workflows/deploy-worker.yml` выполнит:
 1. `npm ci`
 2. `npm test`
 3. `wrangler d1 migrations apply plat_telegram --remote`
-4. `wrangler deploy`
-5. `wrangler secret put ...`
-6. `node scripts/set-webhook.mjs`
+4. `npm run db:seed-fts:remote`
+5. `wrangler deploy`
+6. `wrangler secret put ...`
+7. `node scripts/set-webhook.mjs`
+
+## FTS seed
+
+После миграции `search_index` нужно один раз заполнить индекс существующими данными. Workflow делает это автоматически командой:
+
+```bash
+npm run db:seed-fts:remote
+```
+
+Для локальной базы:
+
+```bash
+npm run db:migrate:local
+npm run db:seed-fts:local
+```
 
 ## Локальная разработка
 

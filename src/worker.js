@@ -3,18 +3,24 @@ import {
   commandPayload,
   isValidUrl,
   parseAllowedUsers,
-  truncateText,
+  isTaskStatus,
+  taskWebButton,
+  truncateTelegramText,
 } from "./utils.js";
 import { handleWebRequest } from "./web.js";
-import { cleanupAuditLog, notifyTaskStatusChanged, runTaskDeadlineNotifications } from "./notifications.js";
+import { cleanupAuditLog, notifyMentionedUsers, notifyTaskStatusChanged, runTaskDeadlineNotifications } from "./notifications.js";
 import {
+  createTaskComment,
   createLink,
   createTask,
   createTextEntity as createRepositoryTextEntity,
   findUserByTelegramId,
+  getTaskForComment,
   getOrCreateProject,
   updateTaskStatus,
 } from "./repository.js";
+
+const TELEGRAM_WRITE_ROLES = new Set(["admin", "manager", "editor"]);
 
 function json(data, init = {}) {
   return new Response(JSON.stringify(data), {
@@ -32,7 +38,7 @@ async function sendMessage(env, chatId, text, options = {}) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       chat_id: chatId,
-      text: truncateText(text),
+      text: truncateTelegramText(text),
       disable_web_page_preview: true,
       ...options,
     }),
@@ -50,7 +56,7 @@ async function answerCallbackQuery(env, callbackQueryId, text) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       callback_query_id: callbackQueryId,
-      text: truncateText(text, 180),
+      text: truncateTelegramText(text, 180),
     }),
   });
 
@@ -67,7 +73,7 @@ async function editMessageText(env, chatId, messageId, text, options = {}) {
     body: JSON.stringify({
       chat_id: chatId,
       message_id: messageId,
-      text: truncateText(text),
+      text: truncateTelegramText(text),
       disable_web_page_preview: true,
       ...options,
     }),
@@ -78,16 +84,26 @@ async function editMessageText(env, chatId, messageId, text, options = {}) {
   }
 }
 
-function taskKeyboard(taskId) {
-  return {
-    inline_keyboard: [
-      [
-        { text: "В работе", callback_data: `task:doing:${taskId}` },
-        { text: "В ревью", callback_data: `task:review:${taskId}` },
-        { text: "Готово", callback_data: `task:done:${taskId}` },
-      ],
-    ],
-  };
+function taskKeyboard(env, taskId, projectId, currentStatus = "") {
+  const statusButtons =
+    currentStatus === "done"
+      ? []
+      : [
+          ["doing", "В работе"],
+          ["review", "В ревью"],
+          ["done", "Готово"],
+        ]
+          .filter(([status]) => status !== currentStatus)
+          .map(([status, label]) => ({ text: label, callback_data: `task_status:${status}:${taskId}` }));
+  const keyboard = [];
+  if (statusButtons.length) {
+    keyboard.push(statusButtons);
+  }
+  const webButton = taskWebButton(env, projectId, taskId);
+  if (webButton) {
+    keyboard.push([webButton]);
+  }
+  return { inline_keyboard: keyboard };
 }
 
 function taskSummary(task, projectName, authorName = "—") {
@@ -105,6 +121,30 @@ async function scheduleBackground(ctx, promise) {
 function isAllowed(env, userId) {
   const allowedUsers = parseAllowedUsers(env.ALLOWED_USERS || "");
   return allowedUsers.size === 0 || allowedUsers.has(userId);
+}
+
+function canTelegramWrite(user) {
+  return Boolean(user?.is_active && TELEGRAM_WRITE_ROLES.has(user.role));
+}
+
+function parseTaskStatusCallback(data) {
+  const match = String(data || "").match(/^(?:task_status|task):(doing|review|done):(\d+)$/);
+  if (!match) return null;
+  const taskId = Number.parseInt(match[2], 10);
+  if (!Number.isInteger(taskId) || !isTaskStatus(match[1])) return null;
+  return { status: match[1], taskId };
+}
+
+async function getTelegramTask(db, taskId) {
+  return await db
+    .prepare(
+      `SELECT t.id, t.text, t.status, t.project_id, t.is_deleted, p.name AS project_name
+       FROM tasks t
+       JOIN projects p ON p.id = t.project_id
+       WHERE t.id = ?`,
+    )
+    .bind(taskId)
+    .first();
 }
 
 async function setActiveProject(db, chatId, name) {
@@ -170,6 +210,7 @@ async function handleStart(env, message) {
       "/task_doing id - перевести задачу в doing",
       "/task_review id - перевести задачу в review",
       "/task_done id - завершить задачу",
+      "/comment id текст - добавить комментарий к задаче",
       "/ideas - список идей",
       "/notes - список заметок",
       "/decisions - список решений",
@@ -229,7 +270,7 @@ async function handleTask(env, message, user) {
     source: "telegram",
   });
   await sendMessage(env, message.chat.id, taskSummary(task, project.name, user?.username || message.from.username || message.from.first_name || "—"), {
-    reply_markup: taskKeyboard(task.id),
+    reply_markup: taskKeyboard(env, task.id, project.id, task.status || "todo"),
   });
 }
 
@@ -252,6 +293,11 @@ async function handleTasks(env, message) {
 }
 
 async function handleTaskStatusCommand(env, message, user, status, commandName, ctx = null) {
+  if (!canTelegramWrite(user)) {
+    await sendMessage(env, message.chat.id, "У вашей роли нет права менять статус задач.");
+    return;
+  }
+
   const payload = commandPayload(message);
   const taskId = Number.parseInt(payload, 10);
   if (!Number.isInteger(taskId)) {
@@ -261,6 +307,19 @@ async function handleTaskStatusCommand(env, message, user, status, commandName, 
 
   const project = await requireActiveProject(env, message);
   if (!project) return;
+  const task = await getTelegramTask(env.DB, taskId);
+  if (!task || task.is_deleted || task.project_id !== project.id) {
+    await sendMessage(env, message.chat.id, "Задача не найдена в текущем проекте.");
+    return;
+  }
+  if (task.status === status) {
+    await sendMessage(env, message.chat.id, "Статус уже установлен.");
+    return;
+  }
+  if (task.status === "done" && status !== "done") {
+    await sendMessage(env, message.chat.id, "Завершённую задачу нельзя вернуть через Telegram-команду. Используйте web panel.");
+    return;
+  }
 
   try {
     const result = await updateTaskStatus(env.DB, {
@@ -282,6 +341,51 @@ async function handleTaskDone(env, message, user, ctx = null) {
   await handleTaskStatusCommand(env, message, user, "done", "task_done", ctx);
 }
 
+async function handleComment(env, message, user, ctx = null) {
+  if (!canTelegramWrite(user)) {
+    await sendMessage(env, message.chat.id, "У вашей роли нет права добавлять комментарии.");
+    return;
+  }
+  const payload = commandPayload(message);
+  const match = payload.match(/^(\d+)\s+([\s\S]+)$/);
+  if (!match) {
+    await sendMessage(env, message.chat.id, "Укажите задачу и текст: /comment 42 текст комментария");
+    return;
+  }
+  const taskId = Number.parseInt(match[1], 10);
+  const body = match[2].trim();
+  const task = await getTaskForComment(env.DB, taskId);
+  if (!task || task.is_deleted) {
+    await sendMessage(env, message.chat.id, "Задача не найдена.");
+    return;
+  }
+  const activeProject = await getActiveProject(env.DB, message.chat.id);
+  const crossProjectContext = Boolean(activeProject && activeProject.id !== task.project_id);
+  const comment = await createTaskComment(env.DB, {
+    taskId,
+    authorUserId: user.id,
+    body,
+    source: "telegram",
+    crossProjectContext,
+  });
+  await scheduleBackground(
+    ctx,
+    notifyMentionedUsers(env, {
+      taskId,
+      projectId: task.project_id,
+      projectName: task.project_name,
+      taskText: task.text,
+      commentBody: comment.body,
+      authorUserId: user.id,
+      authorName: user.username,
+    }),
+  );
+  const warning = crossProjectContext ? "\nВнимание: задача из другого проекта, не из активного проекта чата." : "";
+  await sendMessage(env, message.chat.id, `Комментарий #${comment.id} добавлен к задаче #${taskId} (${task.project_name}).${warning}`, {
+    reply_markup: taskKeyboard(env, task.id, task.project_id, task.status),
+  });
+}
+
 async function handleTaskCallback(env, callbackQuery, ctx = null) {
   const userId = callbackQuery.from?.id;
   if (!isAllowed(env, userId)) {
@@ -289,30 +393,34 @@ async function handleTaskCallback(env, callbackQuery, ctx = null) {
     return;
   }
 
-  const match = String(callbackQuery.data || "").match(/^task:(doing|review|done):(\d+)$/);
-  if (!match) {
+  const payload = parseTaskStatusCallback(callbackQuery.data);
+  if (!payload) {
     await answerCallbackQuery(env, callbackQuery.id, "Неизвестное действие.");
     return;
   }
 
-  const status = match[1];
-  const taskId = Number.parseInt(match[2], 10);
-  const task = await env.DB
-    .prepare(
-      `SELECT t.id, t.text, t.status, t.project_id, p.name AS project_name
-       FROM tasks t
-       JOIN projects p ON p.id = t.project_id
-       WHERE t.id = ? AND t.is_deleted = 0`,
-    )
-    .bind(taskId)
-    .first();
+  const status = payload.status;
+  const taskId = payload.taskId;
+  const task = await getTelegramTask(env.DB, taskId);
 
-  if (!task) {
+  if (!task || task.is_deleted) {
     await answerCallbackQuery(env, callbackQuery.id, "Задача не найдена.");
     return;
   }
 
   const user = await findUserByTelegramId(env.DB, userId);
+  if (!canTelegramWrite(user)) {
+    await answerCallbackQuery(env, callbackQuery.id, "У вашей роли нет права менять статус задач.");
+    return;
+  }
+  if (task.status === status) {
+    await answerCallbackQuery(env, callbackQuery.id, "Статус уже установлен.");
+    return;
+  }
+  if (task.status === "done" && status !== "done") {
+    await answerCallbackQuery(env, callbackQuery.id, "Задача уже завершена.");
+    return;
+  }
   let result;
   try {
     result = await updateTaskStatus(env.DB, {
@@ -332,7 +440,7 @@ async function handleTaskCallback(env, callbackQuery, ctx = null) {
   const message = callbackQuery.message;
   if (message?.chat?.id && message.message_id) {
     await editMessageText(env, message.chat.id, message.message_id, `Задача #${task.id} в проекте ${task.project_name}: ${task.text}\nСтатус: ${status}.`, {
-      reply_markup: taskKeyboard(task.id),
+      reply_markup: taskKeyboard(env, task.id, task.project_id, status),
     });
   }
 }
@@ -490,6 +598,9 @@ async function handleTelegramUpdate(env, update, ctx = null) {
       break;
     case "/task_done":
       await handleTaskDone(env, message, user, ctx);
+      break;
+    case "/comment":
+      await handleComment(env, message, user, ctx);
       break;
     case "/ideas":
       await handleEntityList(env, message, "ideas", "Идеи");

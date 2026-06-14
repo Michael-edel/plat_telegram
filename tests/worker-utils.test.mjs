@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { createCsrfToken, hashPassword, verifyCsrfToken, verifyPassword } from "../src/auth.js";
 import { timezoneModifier } from "../src/repository.js";
-import { commandPayload, extractHashtags, isTaskStatus, isValidUrl, parseAllowedUsers } from "../src/utils.js";
+import { commandPayload, extractHashtags, extractMentions, isTaskStatus, isValidUrl, parseAllowedUsers, taskWebUrl, truncateTelegramText } from "../src/utils.js";
 
 test("extractHashtags returns unique lower-case tags", () => {
   assert.deepEqual(extractHashtags("Идея #AI #бот #ai #Бот"), ["ai", "бот"]);
@@ -18,6 +18,10 @@ test("isValidUrl accepts only http and https", () => {
 
 test("parseAllowedUsers parses comma-separated ids", () => {
   assert.deepEqual([...parseAllowedUsers("111, 222, bad").values()], [111, 222]);
+});
+
+test("extractMentions returns unique lower-case usernames", () => {
+  assert.deepEqual(extractMentions("Привет @Michael и @alex_1, снова @michael"), ["michael", "alex_1"]);
 });
 
 test("commandPayload falls back to reply text", () => {
@@ -42,6 +46,16 @@ test("timezoneModifier formats sqlite hour offsets", () => {
   assert.equal(timezoneModifier({ APP_TIMEZONE_OFFSET_HOURS: "5" }), "+5 hours");
   assert.equal(timezoneModifier({ APP_TIMEZONE_OFFSET_HOURS: "-3" }), "-3 hours");
   assert.equal(timezoneModifier({ APP_TIMEZONE_OFFSET_HOURS: "bad" }), "+0 hours");
+});
+
+test("taskWebUrl builds deep links from app base url", () => {
+  assert.equal(taskWebUrl({ APP_BASE_URL: "https://bot.michael.kz/" }, 5, 42), "https://bot.michael.kz/app/projects/5?task=42");
+});
+
+test("truncateTelegramText uses safe telegram size", () => {
+  const value = "x".repeat(3600);
+  assert.equal(truncateTelegramText(value).length, 3500);
+  assert.equal(truncateTelegramText(value).endsWith("…"), true);
 });
 
 test("password hashes verify only matching passwords", async () => {

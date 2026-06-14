@@ -30,15 +30,15 @@ export async function auditLog(db, { userId = null, action, entityType = null, e
     .run();
 }
 
-export async function changeLog(db, { userId = null, entityType, entityId, fieldName, oldValue = null, newValue = null }) {
+export async function changeLog(db, { userId = null, entityType, entityId, fieldName, oldValue = null, newValue = null, eventType = null, details = null }) {
   if (String(oldValue ?? "") === String(newValue ?? "")) {
     return;
   }
   await db
     .prepare(
-      "INSERT INTO change_log (user_id, entity_type, entity_id, field_name, old_value, new_value, created_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+      "INSERT INTO change_log (user_id, entity_type, entity_id, field_name, old_value, new_value, event_type, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
     )
-    .bind(userId, entityType, entityId, fieldName, oldValue == null ? null : String(oldValue), newValue == null ? null : String(newValue))
+    .bind(userId, entityType, entityId, fieldName, oldValue == null ? null : String(oldValue), newValue == null ? null : String(newValue), eventType, detailsJson(details))
     .run();
 }
 
@@ -56,6 +56,11 @@ function cleanAssigneeId(value) {
   return Number.isInteger(id) && id > 0 ? id : null;
 }
 
+function previewText(value, maxLength = 180) {
+  const text = String(value || "").trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+}
+
 export async function findUserByTelegramId(db, telegramId) {
   if (!telegramId) {
     return null;
@@ -64,6 +69,23 @@ export async function findUserByTelegramId(db, telegramId) {
     .prepare("SELECT id, username, role, is_active FROM users WHERE telegram_id = ? AND is_active = 1")
     .bind(String(telegramId))
     .first();
+}
+
+export async function findUsersByUsernames(db, usernames) {
+  const cleanUsernames = [...new Set((usernames || []).map((item) => String(item || "").toLowerCase()).filter(Boolean))];
+  if (!cleanUsernames.length) {
+    return [];
+  }
+  const placeholders = cleanUsernames.map(() => "?").join(", ");
+  const { results } = await db
+    .prepare(
+      `SELECT id, username, display_name, telegram_id, role, is_active
+       FROM users
+       WHERE lower(username) IN (${placeholders}) AND is_active = 1`,
+    )
+    .bind(...cleanUsernames)
+    .all();
+  return results;
 }
 
 export async function saveTags(db, entityType, entityId, text) {
@@ -76,6 +98,35 @@ export async function saveTags(db, entityType, entityId, text) {
       .prepare("INSERT OR IGNORE INTO entity_tags (entity_type, entity_id, tag_id) VALUES (?, ?, ?)")
       .bind(entityType, entityId, tagRow.id)
       .run();
+  }
+}
+
+function searchContent(entityType, row) {
+  if (entityType === "link") {
+    return `${row.url || ""} ${row.description || ""}`.trim();
+  }
+  return String(row.text || "").trim();
+}
+
+export async function syncSearchIndex(db, { entityType, entityId, projectId, content }) {
+  try {
+    await db.prepare("DELETE FROM search_index WHERE entity_type = ? AND entity_id = ?").bind(entityType, entityId).run();
+    if (content && String(content).trim()) {
+      await db
+        .prepare("INSERT INTO search_index (entity_type, entity_id, project_id, content) VALUES (?, ?, ?, ?)")
+        .bind(entityType, entityId, projectId, String(content).trim())
+        .run();
+    }
+  } catch (error) {
+    console.error("Search index sync failed", entityType, entityId, error);
+  }
+}
+
+async function removeSearchIndex(db, entityType, entityId) {
+  try {
+    await db.prepare("DELETE FROM search_index WHERE entity_type = ? AND entity_id = ?").bind(entityType, entityId).run();
+  } catch (error) {
+    console.error("Search index delete failed", entityType, entityId, error);
   }
 }
 
@@ -214,7 +265,7 @@ export async function loadProjectData(db, projectId, filters = {}, tzModifier = 
     taskFilters.bindings.push(tzModifier);
   }
 
-  const [tasks, ideas, notes, decisions, links] = await Promise.all([
+  const [tasks, ideas, notes, decisions, links, taskComments, taskActivities] = await Promise.all([
     db
       .prepare(
         `SELECT t.id, t.text, t.status, t.priority, t.due_date, t.assignee_id, au.display_name AS assignee_display_name, au.username AS assignee_username,
@@ -267,6 +318,31 @@ export async function loadProjectData(db, projectId, filters = {}, tzModifier = 
       )
       .bind(projectId, ...linkFilters.bindings)
       .all(),
+    db
+      .prepare(
+        `SELECT c.id, c.task_id, c.body, c.created_at, c.updated_at, c.author_user_id,
+                COALESCE(u.display_name, u.username, '—') AS author_name
+         FROM task_comments c
+         JOIN tasks t ON t.id = c.task_id
+         LEFT JOIN users u ON u.id = c.author_user_id
+         WHERE t.project_id = ? AND c.is_deleted = 0
+         ORDER BY c.created_at ASC`,
+      )
+      .bind(projectId)
+      .all(),
+    db
+      .prepare(
+        `SELECT cl.id, cl.entity_id AS task_id, cl.field_name, cl.old_value, cl.new_value, cl.event_type, cl.details_json, cl.created_at,
+                COALESCE(u.display_name, u.username, '—') AS user_name
+         FROM change_log cl
+         JOIN tasks t ON t.id = cl.entity_id
+         LEFT JOIN users u ON u.id = cl.user_id
+         WHERE cl.entity_type = 'task' AND t.project_id = ?
+         ORDER BY cl.created_at DESC, cl.id DESC
+         LIMIT 200`,
+      )
+      .bind(projectId)
+      .all(),
   ]);
 
   return {
@@ -275,6 +351,8 @@ export async function loadProjectData(db, projectId, filters = {}, tzModifier = 
     notes: notes.results,
     decisions: decisions.results,
     links: links.results,
+    taskComments: taskComments.results,
+    taskActivities: taskActivities.results,
   };
 }
 
@@ -344,6 +422,7 @@ export async function createTask(db, { projectId, text, authorId = null, source 
     details: { project_id: projectId, source },
   });
   await changeLog(db, { userId: authorId, entityType: "task", entityId: task.id, fieldName: "created", oldValue: null, newValue: cleanText });
+  await syncSearchIndex(db, { entityType: "task", entityId: task.id, projectId, content: cleanText });
   return task;
 }
 
@@ -360,25 +439,17 @@ export async function updateTaskStatus(db, { taskId, projectId, status, userId, 
     throw new Error("Задача не найдена");
   }
 
-  await db
-    .prepare("UPDATE tasks SET status = ?, updated_at = datetime('now') WHERE id = ? AND project_id = ? AND is_deleted = 0")
-    .bind(status, taskId, projectId)
-    .run();
-  await auditLog(db, {
-    userId,
-    action: "task.status_changed",
-    entityType: "task",
-    entityId: taskId,
-    details: { project_id: projectId, old_status: existing.status, new_status: status, source },
-  });
-  await changeLog(db, {
-    userId,
-    entityType: "task",
-    entityId: taskId,
-    fieldName: "status",
-    oldValue: existing.status,
-    newValue: status,
-  });
+  await db.batch([
+    db.prepare("UPDATE tasks SET status = ?, updated_at = datetime('now') WHERE id = ? AND project_id = ? AND is_deleted = 0").bind(status, taskId, projectId),
+    db
+      .prepare("INSERT INTO audit_log (user_id, action, entity_type, entity_id, details_json, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))")
+      .bind(userId, "task.status_changed", "task", taskId, detailsJson({ project_id: projectId, old_status: existing.status, new_status: status, source })),
+    db
+      .prepare(
+        "INSERT INTO change_log (user_id, entity_type, entity_id, field_name, old_value, new_value, event_type, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+      )
+      .bind(userId, "task", taskId, "status", existing.status, status, "status_changed", detailsJson({ source })),
+  ]);
   return { taskId, projectId, oldStatus: existing.status, newStatus: status };
 }
 
@@ -415,6 +486,7 @@ export async function updateTaskText(db, { taskId, projectId, text, userId }) {
     oldValue: existing.text,
     newValue: cleanText,
   });
+  await syncSearchIndex(db, { entityType: "task", entityId: taskId, projectId, content: cleanText });
 }
 
 export async function updateTaskMeta(db, { taskId, projectId, priority, dueDate, assigneeId, userId }) {
@@ -479,6 +551,116 @@ export async function softDeleteTask(db, { taskId, projectId, userId }) {
     details: { project_id: projectId, source: "web" },
   });
   await changeLog(db, { userId, entityType: "task", entityId: taskId, fieldName: "deleted", oldValue: "0", newValue: "1" });
+  await removeSearchIndex(db, "task", taskId);
+}
+
+export async function getTaskForComment(db, taskId) {
+  return await db
+    .prepare(
+      `SELECT t.id, t.project_id, t.text, t.status, t.is_deleted, p.name AS project_name
+       FROM tasks t
+       JOIN projects p ON p.id = t.project_id
+       WHERE t.id = ?`,
+    )
+    .bind(taskId)
+    .first();
+}
+
+export async function createTaskComment(db, { taskId, authorUserId = null, body, source = "web", crossProjectContext = false }) {
+  const cleanBody = String(body || "").trim();
+  if (!cleanBody) {
+    throw new Error("Комментарий не может быть пустым");
+  }
+  const task = await getTaskForComment(db, taskId);
+  if (!task || task.is_deleted) {
+    throw new Error("Задача не найдена");
+  }
+
+  const comment = await db
+    .prepare(
+      `INSERT INTO task_comments (task_id, author_user_id, body, created_at)
+       VALUES (?, ?, ?, datetime('now'))
+       RETURNING id, task_id, author_user_id, body, created_at, updated_at`,
+    )
+    .bind(taskId, authorUserId, cleanBody)
+    .first();
+  await changeLog(db, {
+    userId: authorUserId,
+    entityType: "task",
+    entityId: taskId,
+    fieldName: "comment",
+    oldValue: null,
+    newValue: previewText(cleanBody),
+    eventType: "comment_added",
+    details: { comment_id: comment.id, source },
+  });
+  await auditLog(db, {
+    userId: authorUserId,
+    action: crossProjectContext ? "comment.cross_project_context" : "comment.created",
+    entityType: "task",
+    entityId: taskId,
+    details: { comment_id: comment.id, project_id: task.project_id, source },
+  });
+  return { ...comment, project_id: task.project_id, project_name: task.project_name, task_text: task.text };
+}
+
+export async function getTaskComment(db, commentId) {
+  return await db
+    .prepare(
+      `SELECT c.id, c.task_id, c.author_user_id, c.body, c.is_deleted, t.project_id
+       FROM task_comments c
+       JOIN tasks t ON t.id = c.task_id
+       WHERE c.id = ?`,
+    )
+    .bind(commentId)
+    .first();
+}
+
+export async function updateTaskComment(db, { commentId, body, userId }) {
+  const cleanBody = String(body || "").trim();
+  if (!cleanBody) {
+    throw new Error("Комментарий не может быть пустым");
+  }
+  const existing = await getTaskComment(db, commentId);
+  if (!existing || existing.is_deleted) {
+    throw new Error("Комментарий не найден");
+  }
+  await db
+    .prepare("UPDATE task_comments SET body = ?, updated_at = datetime('now') WHERE id = ? AND is_deleted = 0")
+    .bind(cleanBody, commentId)
+    .run();
+  await changeLog(db, {
+    userId,
+    entityType: "task",
+    entityId: existing.task_id,
+    fieldName: "comment",
+    oldValue: previewText(existing.body),
+    newValue: previewText(cleanBody),
+    eventType: "comment_edited",
+    details: { comment_id: commentId },
+  });
+  await auditLog(db, { userId, action: "comment.edited", entityType: "task", entityId: existing.task_id, details: { comment_id: commentId, project_id: existing.project_id } });
+  return { taskId: existing.task_id, projectId: existing.project_id };
+}
+
+export async function softDeleteTaskComment(db, { commentId, userId }) {
+  const existing = await getTaskComment(db, commentId);
+  if (!existing || existing.is_deleted) {
+    throw new Error("Комментарий не найден");
+  }
+  await db.prepare("UPDATE task_comments SET is_deleted = 1, deleted_at = datetime('now'), updated_at = datetime('now') WHERE id = ?").bind(commentId).run();
+  await changeLog(db, {
+    userId,
+    entityType: "task",
+    entityId: existing.task_id,
+    fieldName: "comment",
+    oldValue: previewText(existing.body),
+    newValue: "deleted",
+    eventType: "comment_deleted",
+    details: { comment_id: commentId },
+  });
+  await auditLog(db, { userId, action: "comment.deleted", entityType: "task", entityId: existing.task_id, details: { comment_id: commentId, project_id: existing.project_id } });
+  return { taskId: existing.task_id, projectId: existing.project_id };
 }
 
 export async function createTextEntity(db, { table, entityType, projectId, text, authorId = null, source = "web" }) {
@@ -503,6 +685,7 @@ export async function createTextEntity(db, { table, entityType, projectId, text,
     details: { project_id: projectId, source },
   });
   await changeLog(db, { userId: authorId, entityType, entityId: row.id, fieldName: "created", oldValue: null, newValue: cleanText });
+  await syncSearchIndex(db, { entityType, entityId: row.id, projectId, content: cleanText });
   return row;
 }
 
@@ -540,6 +723,7 @@ export async function updateTextEntity(db, { table, entityType, entityId, projec
     oldValue: existing.text,
     newValue: cleanText,
   });
+  await syncSearchIndex(db, { entityType, entityId, projectId, content: cleanText });
 }
 
 export async function softDeleteTextEntity(db, { table, entityType, entityId, projectId, userId }) {
@@ -558,6 +742,7 @@ export async function softDeleteTextEntity(db, { table, entityType, entityId, pr
     details: { project_id: projectId, source: "web" },
   });
   await changeLog(db, { userId, entityType, entityId, fieldName: "deleted", oldValue: "0", newValue: "1" });
+  await removeSearchIndex(db, entityType, entityId);
 }
 
 export async function createLink(db, { projectId, url, description, authorId = null, source = "web" }) {
@@ -578,6 +763,7 @@ export async function createLink(db, { projectId, url, description, authorId = n
     details: { project_id: projectId, source },
   });
   await changeLog(db, { userId: authorId, entityType: "link", entityId: link.id, fieldName: "created", oldValue: null, newValue: cleanUrl });
+  await syncSearchIndex(db, { entityType: "link", entityId: link.id, projectId, content: searchContent("link", link) });
   return link;
 }
 
@@ -604,6 +790,7 @@ export async function updateLink(db, { linkId, projectId, url, description, user
     changeLog(db, { userId, entityType: "link", entityId: linkId, fieldName: "url", oldValue: existing.url, newValue: cleanUrl }),
     changeLog(db, { userId, entityType: "link", entityId: linkId, fieldName: "description", oldValue: existing.description, newValue: cleanDescription || null }),
   ]);
+  await syncSearchIndex(db, { entityType: "link", entityId: linkId, projectId, content: `${cleanUrl} ${cleanDescription}` });
 }
 
 export async function softDeleteLink(db, { linkId, projectId, userId }) {
@@ -619,12 +806,74 @@ export async function softDeleteLink(db, { linkId, projectId, userId }) {
     details: { project_id: projectId, source: "web" },
   });
   await changeLog(db, { userId, entityType: "link", entityId: linkId, fieldName: "deleted", oldValue: "0", newValue: "1" });
+  await removeSearchIndex(db, "link", linkId);
+}
+
+function ftsQuery(value) {
+  return String(value || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((term) => `"${term.replaceAll('"', '""')}"`)
+    .join(" ");
+}
+
+async function searchProjectFts(db, projectId, query, filters = {}) {
+  if (filters.tag) return null;
+  const match = ftsQuery(query);
+  if (!match) return [];
+  const { results } = await db
+    .prepare(
+      `SELECT entity_type, entity_id, project_id, snippet(search_index, 3, '', '', '…', 12) AS preview
+       FROM search_index
+       WHERE search_index MATCH ? AND project_id = ?
+       LIMIT 30`,
+    )
+    .bind(match, projectId)
+    .all();
+  const output = [];
+  for (const item of results) {
+    if (filters.entityType && item.entity_type !== filters.entityType) continue;
+    const row = await searchResultRow(db, item.entity_type, item.entity_id, projectId);
+    if (row) {
+      output.push({ ...row, text: item.preview || row.text });
+    }
+  }
+  return output;
+}
+
+async function searchResultRow(db, entityType, entityId, projectId) {
+  const labels = { task: "Задача", idea: "Идея", note: "Заметка", decision: "Решение", link: "Ссылка" };
+  if (entityType === "task") {
+    const row = await db.prepare("SELECT id, text FROM tasks WHERE id = ? AND project_id = ? AND is_deleted = 0").bind(entityId, projectId).first();
+    return row ? { kind: labels.task, entity_type: "task", ...row } : null;
+  }
+  if (entityType === "link") {
+    const row = await db
+      .prepare("SELECT id, COALESCE(url, '') || ' ' || COALESCE(description, '') AS text FROM links WHERE id = ? AND project_id = ? AND is_deleted = 0")
+      .bind(entityId, projectId)
+      .first();
+    return row ? { kind: labels.link, entity_type: "link", ...row } : null;
+  }
+  const table = ENTITY_TABLE_BY_TYPE[entityType];
+  if (!table || !labels[entityType]) return null;
+  const row = await db.prepare(`SELECT id, text FROM ${table} WHERE id = ? AND project_id = ? AND is_deleted = 0`).bind(entityId, projectId).first();
+  return row ? { kind: labels[entityType], entity_type: entityType, ...row } : null;
 }
 
 export async function searchProject(db, projectId, query, filters = {}) {
   const cleanQuery = query.trim();
   if (!cleanQuery) {
     return [];
+  }
+
+  try {
+    const ftsResults = await searchProjectFts(db, projectId, cleanQuery, filters);
+    if (ftsResults) {
+      return ftsResults;
+    }
+  } catch (error) {
+    console.error("FTS search failed, falling back to LIKE", error);
   }
 
   const tagFilter = (alias, entityType) =>
@@ -795,7 +1044,8 @@ export async function restoreEntity(db, { entityType, entityId, userId }) {
   if (!table) {
     throw new Error("Некорректный тип записи");
   }
-  const existing = await db.prepare(`SELECT id, project_id FROM ${table} WHERE id = ? AND is_deleted = 1`).bind(entityId).first();
+  const titleColumn = entityType === "link" ? "COALESCE(url, '') || ' ' || COALESCE(description, '') AS content" : "text AS content";
+  const existing = await db.prepare(`SELECT id, project_id, ${titleColumn} FROM ${table} WHERE id = ? AND is_deleted = 1`).bind(entityId).first();
   if (!existing) {
     throw new Error("Удалённая запись не найдена");
   }
@@ -808,5 +1058,6 @@ export async function restoreEntity(db, { entityType, entityId, userId }) {
     details: { project_id: existing.project_id, source: "web" },
   });
   await changeLog(db, { userId, entityType, entityId, fieldName: "restored", oldValue: "1", newValue: "0" });
+  await syncSearchIndex(db, { entityType, entityId, projectId: existing.project_id, content: existing.content });
   return existing;
 }

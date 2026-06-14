@@ -1,5 +1,5 @@
-import { auditLog, timezoneModifier } from "./repository.js";
-import { parseAllowedUsers, truncateText } from "./utils.js";
+import { auditLog, findUsersByUsernames, timezoneModifier } from "./repository.js";
+import { extractMentions, parseAllowedUsers, taskWebButton, truncateTelegramText } from "./utils.js";
 
 const DEFAULT_DUE_SOON_HOURS = 24;
 
@@ -18,15 +18,16 @@ function isAllowedTelegramUser(env, telegramId) {
   return allowedUsers.size === 0 || allowedUsers.has(Number(telegramId));
 }
 
-async function sendTelegramMessage(env, chatId, text) {
+async function sendTelegramMessage(env, chatId, text, options = {}) {
   if (!env.BOT_TOKEN || !chatId) return false;
   const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       chat_id: chatId,
-      text: truncateText(text),
+      text: truncateTelegramText(text),
       disable_web_page_preview: true,
+      ...options,
     }),
   });
 
@@ -41,7 +42,7 @@ async function notifyUser(env, user, text, auditDetails) {
   if (!user?.telegram_id || !isAllowedTelegramUser(env, user.telegram_id)) {
     return false;
   }
-  const sent = await sendTelegramMessage(env, user.telegram_id, text);
+  const sent = await sendTelegramMessage(env, user.telegram_id, text, auditDetails.replyOptions || {});
   if (sent) {
     await auditLog(env.DB, {
       userId: user.id,
@@ -56,7 +57,7 @@ async function notifyUser(env, user, text, auditDetails) {
 
 async function notifyOverviewChat(env, text, auditDetails) {
   if (!env.TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID) return false;
-  const sent = await sendTelegramMessage(env, env.TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID, text);
+  const sent = await sendTelegramMessage(env, env.TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID, text, auditDetails.replyOptions || {});
   if (sent) {
     await auditLog(env.DB, {
       action: "notification.sent",
@@ -71,7 +72,7 @@ async function notifyOverviewChat(env, text, auditDetails) {
 async function taskNotificationContext(db, taskId) {
   return await db
     .prepare(
-      `SELECT t.id, t.text, t.status, t.priority, t.due_date, t.assignee_id, p.name AS project_name,
+      `SELECT t.id, t.project_id, t.text, t.status, t.priority, t.due_date, t.assignee_id, p.name AS project_name,
               u.id AS user_id, u.telegram_id, u.username, u.display_name
        FROM tasks t
        JOIN projects p ON p.id = t.project_id
@@ -82,6 +83,11 @@ async function taskNotificationContext(db, taskId) {
     .first();
 }
 
+function taskReplyOptions(env, task) {
+  const button = taskWebButton(env, task.project_id, task.id);
+  return button ? { reply_markup: { inline_keyboard: [[button]] } } : {};
+}
+
 function contextUser(row) {
   return row?.user_id ? { id: row.user_id, telegram_id: row.telegram_id, username: row.username, display_name: row.display_name } : null;
 }
@@ -89,6 +95,7 @@ function contextUser(row) {
 export async function notifyTaskAssigned(env, taskId, previousAssigneeId, nextAssigneeId) {
   if (!nextAssigneeId || String(previousAssigneeId || "") === String(nextAssigneeId || "")) return;
   const task = await taskNotificationContext(env.DB, taskId);
+  if (!task) return;
   const user = contextUser(task);
   await notifyUser(
     env,
@@ -98,6 +105,7 @@ export async function notifyTaskAssigned(env, taskId, previousAssigneeId, nextAs
       entityType: "task",
       entityId: task.id,
       details: { type: "task.assigned", project: task.project_name },
+      replyOptions: taskReplyOptions(env, task),
     },
   );
 }
@@ -111,12 +119,44 @@ export async function notifyTaskStatusChanged(env, taskId, oldStatus, newStatus)
     entityType: "task",
     entityId: task.id,
     details: { type: "task.status_changed", old_status: oldStatus, new_status: newStatus, project: task.project_name },
+    replyOptions: taskReplyOptions(env, task),
   });
   await notifyOverviewChat(env, text, {
     entityType: "task",
     entityId: task.id,
     details: { type: "task.status_changed", old_status: oldStatus, new_status: newStatus, project: task.project_name },
+    replyOptions: taskReplyOptions(env, task),
   });
+}
+
+export async function notifyMentionedUsers(env, { taskId, projectId, projectName, taskText, commentBody, authorUserId, authorName }) {
+  const usernames = extractMentions(commentBody);
+  if (!usernames.length) return { notified: 0 };
+  const users = await findUsersByUsernames(env.DB, usernames);
+  let notified = 0;
+  const replyOptions = (() => {
+    const button = taskWebButton(env, projectId, taskId);
+    return button ? { reply_markup: { inline_keyboard: [[button]] } } : {};
+  })();
+
+  for (const user of users) {
+    if (String(user.id) === String(authorUserId || "")) {
+      continue;
+    }
+    const sent = await notifyUser(
+      env,
+      user,
+      `${authorName || "Пользователь"} упомянул вас в задаче #${taskId} (${projectName}): ${taskText}\n\n${commentBody}`,
+      {
+        entityType: "task",
+        entityId: taskId,
+        details: { type: "comment.mention", project: projectName },
+        replyOptions,
+      },
+    );
+    if (sent) notified += 1;
+  }
+  return { notified };
 }
 
 async function dueTaskRows(env, mode) {
@@ -125,7 +165,7 @@ async function dueTaskRows(env, mode) {
     const days = notificationWindowDays(env);
     return await env.DB
       .prepare(
-        `SELECT t.id, t.text, t.priority, t.due_date, p.name AS project_name,
+        `SELECT t.id, t.project_id, t.text, t.priority, t.due_date, p.name AS project_name,
                 u.id AS user_id, u.telegram_id, u.username, u.display_name
          FROM tasks t
          JOIN projects p ON p.id = t.project_id
@@ -144,7 +184,7 @@ async function dueTaskRows(env, mode) {
   }
   return await env.DB
     .prepare(
-      `SELECT t.id, t.text, t.priority, t.due_date, p.name AS project_name,
+      `SELECT t.id, t.project_id, t.text, t.priority, t.due_date, p.name AS project_name,
               u.id AS user_id, u.telegram_id, u.username, u.display_name
        FROM tasks t
        JOIN projects p ON p.id = t.project_id
@@ -172,11 +212,13 @@ export async function runTaskDeadlineNotifications(env) {
       entityType: "task",
       entityId: task.id,
       details: { type: "task.due_soon", due_date: task.due_date, project: task.project_name },
+      replyOptions: taskReplyOptions(env, task),
     });
     const overviewSent = await notifyOverviewChat(env, text, {
       entityType: "task",
       entityId: task.id,
       details: { type: "task.due_soon", due_date: task.due_date, project: task.project_name },
+      replyOptions: taskReplyOptions(env, task),
     });
     if (userSent || overviewSent) {
       sent += 1;
@@ -190,11 +232,13 @@ export async function runTaskDeadlineNotifications(env) {
       entityType: "task",
       entityId: task.id,
       details: { type: "task.overdue", due_date: task.due_date, project: task.project_name },
+      replyOptions: taskReplyOptions(env, task),
     });
     const overviewSent = await notifyOverviewChat(env, text, {
       entityType: "task",
       entityId: task.id,
       details: { type: "task.overdue", due_date: task.due_date, project: task.project_name },
+      replyOptions: taskReplyOptions(env, task),
     });
     if (userSent || overviewSent) {
       sent += 1;

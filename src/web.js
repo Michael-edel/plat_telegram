@@ -16,9 +16,11 @@ import {
 import {
   ENTITY_CONFIG,
   auditLog,
+  createTaskComment,
   createLink,
   createTask,
   createTextEntity,
+  getTaskComment,
   getOrCreateProject,
   getProject,
   getUser,
@@ -34,17 +36,19 @@ import {
   restoreEntity,
   searchProject,
   softDeleteLink,
+  softDeleteTaskComment,
   softDeleteTask,
   softDeleteTextEntity,
   TASK_PRIORITIES,
   timezoneModifier,
   updateLink,
+  updateTaskComment,
   updateTaskMeta,
   updateTaskStatus,
   updateTaskText,
   updateTextEntity,
 } from "./repository.js";
-import { notifyTaskAssigned, notifyTaskStatusChanged, runTaskDeadlineNotifications } from "./notifications.js";
+import { notifyMentionedUsers, notifyTaskAssigned, notifyTaskStatusChanged, runTaskDeadlineNotifications } from "./notifications.js";
 import { isTaskStatus, isValidUrl } from "./utils.js";
 
 const ENTITY_PATHS = {
@@ -167,6 +171,10 @@ function canManageProjects(user) {
   return requireRole(user, ["admin", "manager"]);
 }
 
+function canManageComment(user, comment) {
+  return Boolean(user && (["admin", "manager"].includes(user.role) || String(comment.author_user_id || "") === String(user.id)));
+}
+
 function dueSoonDays(env) {
   const hours = Number.parseInt(env.TASK_DUE_SOON_HOURS || "", 10);
   return Number.isInteger(hours) && hours > 0 ? Math.max(1, Math.ceil(hours / 24)) : 3;
@@ -264,7 +272,11 @@ function renderLayout({ title, content, user, csrfToken }) {
     .column { min-width: 0; background: var(--surface-soft); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
     .task, .card { padding: 12px; overflow-wrap: anywhere; }
     .task { margin-bottom: 10px; }
+    .task.focused { border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37, 99, 235, .14); }
     .task-footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+    .task-comments, .task-activity { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; display: grid; gap: 8px; }
+    .comment { border: 1px solid var(--border); border-radius: 8px; padding: 10px; background: #fff; display: grid; gap: 6px; }
+    h4 { margin: 0; font-size: 14px; letter-spacing: 0; }
     form.compact { display: grid; gap: 8px; }
     input, textarea, select {
       width: 100%;
@@ -302,6 +314,7 @@ function renderLayout({ title, content, user, csrfToken }) {
     .filters { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)) auto; gap: 8px; align-items: end; margin-bottom: 12px; }
     .section-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
     .badge { display: inline-flex; align-items: center; border-radius: 999px; padding: 2px 8px; font-size: 12px; background: #e5e7eb; color: #111827; }
+    .notice { padding: 10px 12px; border: 1px solid #bfdbfe; background: #eff6ff; color: #1e3a8a; border-radius: 8px; margin-bottom: 12px; }
     .danger-badge { background: #fee4e2; color: #912018; }
     .warning-badge { background: #fef3c7; color: #92400e; }
     .tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
@@ -405,8 +418,9 @@ async function requireCsrf(request, env, data) {
   }
 }
 
-function projectRedirect(projectId) {
-  return `/app/projects/${encodeURIComponent(projectId)}`;
+function projectRedirect(projectId, taskId = "") {
+  const focus = taskId ? `?task=${encodeURIComponent(taskId)}` : "";
+  return `/app/projects/${encodeURIComponent(projectId)}${focus}`;
 }
 
 function cleanFilter(value) {
@@ -434,6 +448,7 @@ function projectFilterParams(url) {
   const deadline = cleanFilter(url.searchParams.get("deadline"));
   const changeUserId = Number.parseInt(url.searchParams.get("change_user_id") || "", 10);
   const changeEntityType = cleanFilter(url.searchParams.get("change_entity_type"));
+  const focusTaskId = Number.parseInt(url.searchParams.get("task") || "", 10);
   return {
     q: cleanFilter(url.searchParams.get("q")),
     status: isTaskStatus(status) ? status : "",
@@ -443,6 +458,7 @@ function projectFilterParams(url) {
     deadline: ["", "none", "today", "week", "overdue"].includes(deadline) ? deadline : "",
     changeUserId: Number.isInteger(changeUserId) ? changeUserId : "",
     changeEntityType: ["", "task", "idea", "note", "decision", "link"].includes(changeEntityType) ? changeEntityType : "",
+    focusTaskId: Number.isInteger(focusTaskId) && focusTaskId > 0 ? focusTaskId : "",
     tag: cleanFilter(url.searchParams.get("tag")).replace(/^#/, "").toLowerCase(),
   };
 }
@@ -530,7 +546,57 @@ function renderAssigneeOptions(assignableUsers, currentId = "") {
     .join("");
 }
 
-function renderTask(task, projectId, user, csrfToken, assignableUsers) {
+function activityText(row) {
+  if (row.event_type === "comment_added") return `${row.user_name} добавил комментарий: ${row.new_value || ""}`;
+  if (row.event_type === "comment_edited") return `${row.user_name} изменил комментарий`;
+  if (row.event_type === "comment_deleted") return `${row.user_name} удалил комментарий`;
+  if (row.field_name === "created") return `${row.user_name} создал задачу`;
+  if (row.field_name === "deleted") return `${row.user_name} удалил задачу`;
+  return `${row.user_name} изменил ${row.field_name}: ${row.old_value || "—"} -> ${row.new_value || "—"}`;
+}
+
+function renderTaskActivities(rows) {
+  if (!rows.length) return `<p class="muted">Активности пока нет.</p>`;
+  return `<div class="activity">${rows
+    .slice(0, 8)
+    .map((row) => `<div class="muted">${escapeHtml(formatDate(row.created_at))} · ${escapeHtml(activityText(row))}</div>`)
+    .join("")}</div>`;
+}
+
+function renderTaskComments(task, comments, user, csrfToken) {
+  const rows = comments.length
+    ? comments
+        .map((comment) => {
+          const actions = canManageComment(user, comment)
+            ? `<form class="compact" method="post" action="/app/comments/${comment.id}/edit">
+                <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+                <textarea name="body" required>${escapeHtml(comment.body)}</textarea>
+                <button class="secondary" type="submit">Сохранить комментарий</button>
+              </form>
+              <form method="post" action="/app/comments/${comment.id}/delete">
+                <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+                <button class="danger" type="submit">Удалить комментарий</button>
+              </form>`
+            : "";
+          return `<article class="comment">
+            <div>${escapeHtml(comment.body)}</div>
+            <div class="muted">${escapeHtml(comment.author_name || "—")} · ${escapeHtml(formatDate(comment.created_at))}</div>
+            ${actions}
+          </article>`;
+        })
+        .join("")
+    : `<p class="muted">Комментариев пока нет.</p>`;
+  const form = canWrite(user)
+    ? `<form class="compact" method="post" action="/app/tasks/${task.id}/comments">
+        <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+        <textarea name="body" placeholder="Комментарий к задаче" required></textarea>
+        <button class="secondary" type="submit">Добавить комментарий</button>
+      </form>`
+    : "";
+  return `<div class="task-comments"><h4>Комментарии</h4>${rows}${form}</div>`;
+}
+
+function renderTask(task, projectId, user, csrfToken, assignableUsers, focusTaskId = "", comments = [], activities = []) {
   const options = ["todo", "doing", "review", "done"]
     .map((status) => `<option value="${status}" ${task.status === status ? "selected" : ""}>${status}</option>`)
     .join("");
@@ -562,12 +628,15 @@ function renderTask(task, projectId, user, csrfToken, assignableUsers) {
         <button class="danger" type="submit">Удалить</button>
       </form>`
     : "";
-  return `<article class="task">
+  const isFocused = String(task.id) === String(focusTaskId || "");
+  return `<article class="task ${isFocused ? "focused" : ""}" id="task-${task.id}">
     <div>#${task.id} ${escapeHtml(task.text)}</div>
     ${renderTags(task.tags)}
     <div class="muted">Приоритет: ${escapeHtml(task.priority || "normal")} · Дедлайн: ${escapeHtml(task.due_date || "—")} · Ответственный: ${escapeHtml(assigneeName(task) || "—")}</div>
     ${entityMeta(task)}
     <div class="task-footer">${actions}</div>
+    ${renderTaskComments(task, comments, user, csrfToken)}
+    <div class="task-activity"><h4>Активность</h4>${renderTaskActivities(activities)}</div>
   </article>`;
 }
 
@@ -733,12 +802,42 @@ function renderProject(project, data, searchResults, filters, filterOptions, use
   const tagOptions = [{ name: "" }, ...filterOptions.tags]
     .map((tag) => `<option value="${escapeHtml(tag.name)}" ${selected(tag.name, filters.tag)}>${tag.name ? `#${escapeHtml(tag.name)}` : "Все теги"}</option>`)
     .join("");
+  const commentsByTask = new Map();
+  for (const comment of data.taskComments || []) {
+    if (!commentsByTask.has(comment.task_id)) commentsByTask.set(comment.task_id, []);
+    commentsByTask.get(comment.task_id).push(comment);
+  }
+  const activitiesByTask = new Map();
+  for (const activity of data.taskActivities || []) {
+    if (!activitiesByTask.has(activity.task_id)) activitiesByTask.set(activity.task_id, []);
+    activitiesByTask.get(activity.task_id).push(activity);
+  }
   const taskColumns = ["todo", "doing", "review", "done"]
     .map((status) => {
       const tasks = data.tasks.filter((task) => task.status === status);
-      return `<section class="column"><h3>${status}</h3>${tasks.length ? tasks.map((task) => renderTask(task, project.id, user, csrfToken, filterOptions.assignableUsers)).join("") : `<p class="muted">Нет задач.</p>`}</section>`;
+      return `<section class="column"><h3>${status}</h3>${
+        tasks.length
+          ? tasks
+              .map((task) =>
+                renderTask(
+                  task,
+                  project.id,
+                  user,
+                  csrfToken,
+                  filterOptions.assignableUsers,
+                  filters.focusTaskId,
+                  commentsByTask.get(task.id) || [],
+                  activitiesByTask.get(task.id) || [],
+                ),
+              )
+              .join("")
+          : `<p class="muted">Нет задач.</p>`
+      }</section>`;
     })
     .join("");
+  const focusedTaskExists = filters.focusTaskId ? data.tasks.some((task) => String(task.id) === String(filters.focusTaskId)) : true;
+  const focusNotice = filters.focusTaskId && !focusedTaskExists ? `<div class="notice">Задача #${escapeHtml(filters.focusTaskId)} не найдена в этом проекте или скрыта текущими фильтрами.</div>` : "";
+  const focusScript = filters.focusTaskId && focusedTaskExists ? `<script>document.getElementById("task-${Number(filters.focusTaskId)}")?.scrollIntoView({ block: "center" });</script>` : "";
   const overdueCount = data.tasks.filter((task) => task.status !== "done" && task.due_date && task.due_date < filterOptions.today).length;
   const dueSoonCount = data.tasks.filter(
     (task) => task.status !== "done" && task.due_date && task.due_date >= filterOptions.today && task.due_date <= filterOptions.dueSoonDate,
@@ -749,6 +848,7 @@ function renderProject(project, data, searchResults, filters, filterOptions, use
       <div class="inline-form"><a class="button secondary" href="/app">Все проекты</a><a class="button secondary" href="/app/projects/${project.id}/export.md">Markdown</a><a class="button secondary" href="/app/projects/${project.id}/export.csv">CSV</a><a class="button secondary" href="/app/projects/${project.id}/export.json">JSON</a></div>
     </div>
     <section class="panel" id="search">
+      ${focusNotice}
       <div class="inline-form" style="margin-bottom:12px">
         <span class="badge ${overdueCount ? "danger-badge" : ""}">Просрочено: ${overdueCount}</span>
         <span class="badge ${dueSoonCount ? "warning-badge" : ""}">Дедлайн ≤ ${filterOptions.riskWindowDays} дн.: ${dueSoonCount}</span>
@@ -779,7 +879,7 @@ function renderProject(project, data, searchResults, filters, filterOptions, use
         </div>
       </div>
       ${renderCreateForms(project.id, user, csrfToken, filterOptions.assignableUsers)}
-    </div>`;
+    </div>${focusScript}`;
 }
 
 function renderUsersPage(users, filters, csrfToken) {
@@ -1115,6 +1215,49 @@ async function handleTaskDelete(env, request, user, taskId) {
   const projectId = Number.parseInt(data.project_id, 10);
   await softDeleteTask(env.DB, { taskId, projectId, userId: user.id });
   return redirect(projectRedirect(projectId));
+}
+
+async function handleCreateTaskComment(env, request, user, taskId, ctx) {
+  if (!canWrite(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const comment = await createTaskComment(env.DB, {
+    taskId,
+    authorUserId: user.id,
+    body: String(data.body || ""),
+    source: "web",
+  });
+  await scheduleBackground(
+    ctx,
+    notifyMentionedUsers(env, {
+      taskId,
+      projectId: comment.project_id,
+      projectName: comment.project_name,
+      taskText: comment.task_text,
+      commentBody: comment.body,
+      authorUserId: user.id,
+      authorName: user.display_name || user.username,
+    }),
+  );
+  return redirect(projectRedirect(comment.project_id, taskId));
+}
+
+async function handleCommentEdit(env, request, user, commentId) {
+  const comment = await getTaskComment(env.DB, commentId);
+  if (!comment || !canManageComment(user, comment)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const result = await updateTaskComment(env.DB, { commentId, body: String(data.body || ""), userId: user.id });
+  return redirect(projectRedirect(result.projectId, result.taskId));
+}
+
+async function handleCommentDelete(env, request, user, commentId) {
+  const comment = await getTaskComment(env.DB, commentId);
+  if (!comment || !canManageComment(user, comment)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const result = await softDeleteTaskComment(env.DB, { commentId, userId: user.id });
+  return redirect(projectRedirect(result.projectId, result.taskId));
 }
 
 async function handleCreateEntity(env, request, user, config) {
@@ -1555,6 +1698,18 @@ export async function handleWebRequest(request, env, ctx = null) {
       if (taskAction[2] === "meta") return await handleTaskMeta(env, request, user, taskId, ctx);
       if (taskAction[2] === "edit") return await handleTaskEdit(env, request, user, taskId);
       return await handleTaskDelete(env, request, user, taskId);
+    }
+
+    const taskCommentAction = url.pathname.match(/^\/app\/tasks\/(\d+)\/comments$/);
+    if (request.method === "POST" && taskCommentAction) {
+      return await handleCreateTaskComment(env, request, user, Number.parseInt(taskCommentAction[1], 10), ctx);
+    }
+
+    const commentAction = url.pathname.match(/^\/app\/comments\/(\d+)\/(edit|delete)$/);
+    if (request.method === "POST" && commentAction) {
+      const commentId = Number.parseInt(commentAction[1], 10);
+      if (commentAction[2] === "edit") return await handleCommentEdit(env, request, user, commentId);
+      return await handleCommentDelete(env, request, user, commentId);
     }
 
     for (const [path, config] of Object.entries(ENTITY_PATHS)) {
