@@ -10,6 +10,8 @@ import {
 import { handleWebRequest } from "./web.js";
 import { cleanupAuditLog, notifyMentionedUsers, notifyTaskStatusChanged, runTaskDeadlineNotifications } from "./notifications.js";
 import {
+  archiveEntity,
+  convertEntityToTask,
   createTaskComment,
   createLink,
   createTask,
@@ -106,6 +108,17 @@ function taskKeyboard(env, taskId, projectId, currentStatus = "") {
   return { inline_keyboard: keyboard };
 }
 
+function entityActionKeyboard(entityType, entityId) {
+  return {
+    inline_keyboard: [
+      [
+        { text: "Создать задачу", callback_data: `convert_to_task:${entityType}:${entityId}` },
+        { text: "В архив", callback_data: `archive_entity:${entityType}:${entityId}` },
+      ],
+    ],
+  };
+}
+
 function taskSummary(task, projectName, authorName = "—") {
   return `Задача #${task.id} создана в проекте ${projectName}. Статус: ${task.status || "todo"}. Автор: ${authorName}`;
 }
@@ -133,6 +146,14 @@ function parseTaskStatusCallback(data) {
   const taskId = Number.parseInt(match[2], 10);
   if (!Number.isInteger(taskId) || !isTaskStatus(match[1])) return null;
   return { status: match[1], taskId };
+}
+
+function parseEntityActionCallback(data) {
+  const match = String(data || "").match(/^(convert_to_task|archive_entity):(idea|link):(\d+)$/);
+  if (!match) return null;
+  const entityId = Number.parseInt(match[3], 10);
+  if (!Number.isInteger(entityId) || entityId <= 0) return null;
+  return { action: match[1], entityType: match[2], entityId };
 }
 
 async function getTelegramTask(db, taskId) {
@@ -252,7 +273,9 @@ async function handleIdea(env, message, user) {
   const project = await requireActiveProject(env, message);
   if (!project) return;
   const idea = await createTextEntity(env, "ideas", "idea", project.id, text, user?.id || null);
-  await sendMessage(env, message.chat.id, `Идея #${idea.id} сохранена в проекте ${project.name}. Автор: ${user?.username || message.from.username || message.from.first_name || "—"}`);
+  await sendMessage(env, message.chat.id, `Идея #${idea.id} сохранена в проекте ${project.name}. Автор: ${user?.username || message.from.username || message.from.first_name || "—"}`, {
+    reply_markup: entityActionKeyboard("idea", idea.id),
+  });
 }
 
 async function handleTask(env, message, user) {
@@ -386,7 +409,7 @@ async function handleComment(env, message, user, ctx = null) {
   });
 }
 
-async function handleTaskCallback(env, callbackQuery, ctx = null) {
+async function handleTaskStatusCallback(env, callbackQuery, ctx = null) {
   const userId = callbackQuery.from?.id;
   if (!isAllowed(env, userId)) {
     await answerCallbackQuery(env, callbackQuery.id, "Доступ закрыт.");
@@ -445,6 +468,79 @@ async function handleTaskCallback(env, callbackQuery, ctx = null) {
   }
 }
 
+async function handleEntityActionCallback(env, callbackQuery) {
+  const userId = callbackQuery.from?.id;
+  if (!isAllowed(env, userId)) {
+    await answerCallbackQuery(env, callbackQuery.id, "Доступ закрыт.");
+    return;
+  }
+
+  const payload = parseEntityActionCallback(callbackQuery.data);
+  if (!payload) {
+    await answerCallbackQuery(env, callbackQuery.id, "Неизвестное действие.");
+    return;
+  }
+
+  const user = await findUserByTelegramId(env.DB, userId);
+  if (!canTelegramWrite(user)) {
+    await answerCallbackQuery(env, callbackQuery.id, "У вашей роли нет права выполнять действие.");
+    return;
+  }
+
+  const label = payload.entityType === "idea" ? "Идея" : "Ссылка";
+  try {
+    if (payload.action === "convert_to_task") {
+      const result = await convertEntityToTask(env.DB, {
+        entityType: payload.entityType,
+        entityId: payload.entityId,
+        userId: user.id,
+      });
+      if (result.alreadyDeleted) {
+        await answerCallbackQuery(env, callbackQuery.id, "Уже в архиве или обработано.");
+        return;
+      }
+      await answerCallbackQuery(env, callbackQuery.id, `Создана задача #${result.task.id}`);
+      const message = callbackQuery.message;
+      if (message?.chat?.id && message.message_id) {
+        await editMessageText(env, message.chat.id, message.message_id, `${label} #${payload.entityId} конвертирована в задачу #${result.task.id}.`, {
+          reply_markup: taskKeyboard(env, result.task.id, result.task.project_id, result.task.status || "todo"),
+        });
+      }
+      return;
+    }
+
+    const result = await archiveEntity(env.DB, {
+      entityType: payload.entityType,
+      entityId: payload.entityId,
+      userId: user.id,
+    });
+    if (result.alreadyDeleted) {
+      await answerCallbackQuery(env, callbackQuery.id, "Уже в архиве.");
+      return;
+    }
+    await answerCallbackQuery(env, callbackQuery.id, "Отправлено в архив.");
+    const message = callbackQuery.message;
+    if (message?.chat?.id && message.message_id) {
+      await editMessageText(env, message.chat.id, message.message_id, `${label} #${payload.entityId} отправлена в архив.`);
+    }
+  } catch (error) {
+    console.error("Telegram entity action failed", error);
+    await answerCallbackQuery(env, callbackQuery.id, "Не удалось выполнить действие.");
+  }
+}
+
+async function handleCallbackQuery(env, callbackQuery, ctx = null) {
+  if (parseTaskStatusCallback(callbackQuery.data)) {
+    await handleTaskStatusCallback(env, callbackQuery, ctx);
+    return;
+  }
+  if (parseEntityActionCallback(callbackQuery.data)) {
+    await handleEntityActionCallback(env, callbackQuery);
+    return;
+  }
+  await answerCallbackQuery(env, callbackQuery.id, "Неизвестное действие.");
+}
+
 async function handleNote(env, message, user) {
   const text = commandPayload(message);
   if (!text) {
@@ -492,7 +588,9 @@ async function handleLink(env, message, user) {
     authorId: user?.id || null,
     source: "telegram",
   });
-  await sendMessage(env, message.chat.id, `Ссылка #${link.id} сохранена в проекте ${project.name}. Автор: ${user?.username || message.from.username || message.from.first_name || "—"}`);
+  await sendMessage(env, message.chat.id, `Ссылка #${link.id} сохранена в проекте ${project.name}. Автор: ${user?.username || message.from.username || message.from.first_name || "—"}`, {
+    reply_markup: entityActionKeyboard("link", link.id),
+  });
 }
 
 async function handleEntityList(env, message, table, label) {
@@ -549,7 +647,7 @@ async function handleFind(env, message) {
 
 async function handleTelegramUpdate(env, update, ctx = null) {
   if (update.callback_query) {
-    await handleTaskCallback(env, update.callback_query, ctx);
+    await handleCallbackQuery(env, update.callback_query, ctx);
     return;
   }
 

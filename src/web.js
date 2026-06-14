@@ -15,14 +15,20 @@ import {
 } from "./auth.js";
 import {
   ENTITY_CONFIG,
+  TASK_PRIORITIES,
+  addEntityTags,
   auditLog,
+  changeLog,
   createTaskComment,
   createLink,
   createTask,
   createTextEntity,
+  findUserByUsername,
+  getProcessed1CEvent,
   getTaskComment,
   getOrCreateProject,
   getProject,
+  getProjectByName,
   getUser,
   listAssignableUsers,
   listAudit,
@@ -33,13 +39,15 @@ import {
   listProjects,
   listUsers,
   loadProjectData,
+  mark1CEventFailed,
+  mark1CEventProcessed,
+  reserve1CEvent,
   restoreEntity,
   searchProject,
   softDeleteLink,
   softDeleteTaskComment,
   softDeleteTask,
   softDeleteTextEntity,
-  TASK_PRIORITIES,
   timezoneModifier,
   updateLink,
   updateTaskComment,
@@ -58,6 +66,8 @@ const ENTITY_PATHS = {
 };
 const LOGIN_RATE_LIMIT_WINDOW_MINUTES = 10;
 const LOGIN_RATE_LIMIT_MAX_FAILURES = 8;
+const MAX_1C_BODY_BYTES = 64 * 1024;
+const INTEGRATION_1C_USERNAME = "integration_1c";
 
 function html(body, init = {}) {
   return new Response(body, {
@@ -144,6 +154,11 @@ function escapeHtml(value) {
 
 function csvValue(value) {
   return `"${String(value ?? "").replaceAll('"', '""')}"`;
+}
+
+function previewValue(value, maxLength = 240) {
+  const text = String(value ?? "").trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
 }
 
 function projectFileName(project, extension) {
@@ -1064,6 +1079,174 @@ async function handleProjectExport(env, user, projectId, format) {
   return textResponse(projectMarkdown(project, data), "text/markdown; charset=utf-8", { headers });
 }
 
+function oneCJson(data, status = 200) {
+  return json(data, { status });
+}
+
+async function readOneCEvent(request) {
+  const body = await request.text();
+  const size = new TextEncoder().encode(body).byteLength;
+  if (size > MAX_1C_BODY_BYTES) {
+    throw new Error("Payload is too large");
+  }
+  try {
+    return JSON.parse(body || "{}");
+  } catch {
+    throw new Error("Invalid JSON");
+  }
+}
+
+function validateOneCEnvelope(event) {
+  const eventId = String(event?.event_id || "").trim();
+  if (eventId.length < 8 || eventId.length > 128) {
+    return { error: "event_id must be 8..128 characters" };
+  }
+  if (typeof event?.event_type !== "string" || !event.event_type.trim()) {
+    return { error: "event_type is required", eventId };
+  }
+  if (!event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) {
+    return { error: "payload object is required", eventId };
+  }
+  return { eventId, eventType: event.event_type.trim(), payload: event.payload };
+}
+
+async function duplicateOneCResponse(db, eventId) {
+  const existing = await getProcessed1CEvent(db, eventId);
+  if (existing?.status === "processed") {
+    return oneCJson({
+      status: "success",
+      message: "Duplicate ignored",
+      event_id: eventId,
+      task_id: existing.entity_type === "task" ? existing.entity_id : null,
+    });
+  }
+  if (existing?.status === "failed") {
+    return oneCJson({ status: "failed", message: "Event was previously rejected", event_id: eventId }, 409);
+  }
+  return oneCJson({ status: "processing", message: "Event is already being processed", event_id: eventId }, 202);
+}
+
+async function failOneCEvent(env, eventId, message, status = 400) {
+  await mark1CEventFailed(env.DB, { eventId, errorMessage: message });
+  return oneCJson({ status: "error", message, event_id: eventId }, status);
+}
+
+async function handleOneCWebhook(env, request) {
+  if (request.method !== "POST") {
+    return oneCJson({ status: "error", message: "Method not allowed" }, 405);
+  }
+  if (!env.ONE_C_WEBHOOK_TOKEN) {
+    return oneCJson({ status: "error", message: "Webhook is not configured" }, 503);
+  }
+  if (request.headers.get("X-1C-Webhook-Token") !== env.ONE_C_WEBHOOK_TOKEN) {
+    return oneCJson({ status: "error", message: "Unauthorized" }, 401);
+  }
+
+  let event;
+  try {
+    event = await readOneCEvent(request);
+  } catch (error) {
+    return oneCJson({ status: "error", message: error.message }, 400);
+  }
+
+  const envelope = validateOneCEnvelope(event);
+  if (envelope.error) {
+    return oneCJson({ status: "error", message: envelope.error, ...(envelope.eventId ? { event_id: envelope.eventId } : {}) }, 400);
+  }
+
+  const { eventId, eventType, payload } = envelope;
+  if (!(await reserve1CEvent(env.DB, eventId))) {
+    return await duplicateOneCResponse(env.DB, eventId);
+  }
+
+  try {
+    if (eventType !== "task_created") {
+      return await failOneCEvent(env, eventId, "Unsupported event_type", 400);
+    }
+
+    const projectId = Number.parseInt(event.project_id || "", 10);
+    const project = Number.isInteger(projectId) && projectId > 0 ? await getProject(env.DB, projectId) : await getProjectByName(env.DB, event.project_name);
+    if (!project) {
+      return await failOneCEvent(env, eventId, "Project not found", 400);
+    }
+
+    const text = String(payload.text || "").trim();
+    if (!text) {
+      return await failOneCEvent(env, eventId, "payload.text is required", 400);
+    }
+    if (payload.priority && !TASK_PRIORITIES.includes(String(payload.priority))) {
+      return await failOneCEvent(env, eventId, "Invalid payload.priority", 400);
+    }
+    if (payload.due_date && !/^\d{4}-\d{2}-\d{2}$/.test(String(payload.due_date))) {
+      return await failOneCEvent(env, eventId, "Invalid payload.due_date", 400);
+    }
+    if (payload.tags && !Array.isArray(payload.tags)) {
+      return await failOneCEvent(env, eventId, "payload.tags must be an array", 400);
+    }
+    if (Array.isArray(payload.tags) && payload.tags.some((tag) => typeof tag !== "string")) {
+      return await failOneCEvent(env, eventId, "payload.tags must contain only strings", 400);
+    }
+
+    const integrationUser = await findUserByUsername(env.DB, INTEGRATION_1C_USERNAME);
+    if (!integrationUser) {
+      return await failOneCEvent(env, eventId, "Integration user is not configured", 500);
+    }
+
+    const warnings = [];
+    let assigneeId = null;
+    if (payload.assignee_username) {
+      const assignee = await findUserByUsername(env.DB, payload.assignee_username);
+      if (assignee) {
+        assigneeId = assignee.id;
+      } else {
+        warnings.push(`Assignee not found: ${payload.assignee_username}`);
+      }
+    }
+
+    const task = await createTask(env.DB, {
+      projectId: project.id,
+      text,
+      authorId: integrationUser.id,
+      source: "1c_webhook",
+      priority: String(payload.priority || "normal"),
+      dueDate: String(payload.due_date || ""),
+      assigneeId,
+    });
+    await addEntityTags(env.DB, "task", task.id, ["1с", ...(payload.tags || [])]);
+    await auditLog(env.DB, {
+      userId: integrationUser.id,
+      action: "1c_webhook_task_created",
+      entityType: "task",
+      entityId: task.id,
+      details: { event_id: eventId, event_type: eventType, source: "1c", warnings },
+    });
+    await changeLog(env.DB, {
+      userId: integrationUser.id,
+      entityType: "task",
+      entityId: task.id,
+      fieldName: "1c_webhook",
+      oldValue: null,
+      newValue: eventType,
+      eventType: "1c_webhook_received",
+      details: {
+        event_id: eventId,
+        payload: {
+          text: previewValue(text, 160),
+          priority: task.priority,
+          due_date: task.due_date,
+          assignee_username: payload.assignee_username || null,
+          tags_count: Array.isArray(payload.tags) ? payload.tags.length : 0,
+        },
+      },
+    });
+    await mark1CEventProcessed(env.DB, { eventId, entityType: "task", entityId: task.id });
+    return oneCJson({ status: "success", task_id: task.id, event_id: eventId }, 201);
+  } catch (error) {
+    console.error("1C webhook failed", eventId, error);
+    return await failOneCEvent(env, eventId, error.message || "Internal server error", 500);
+  }
+}
+
 async function handleLogin(request, env) {
   const data = await readRequestData(request);
   if (!(await verifyCsrfToken(request, env, data.csrf_token))) {
@@ -1086,7 +1269,7 @@ async function handleLogin(request, env) {
     .bind(username)
     .first();
 
-  if (!user || !user.is_active || !(await verifyPassword(password, user.password_hash))) {
+  if (!user || !user.is_active || user.username === INTEGRATION_1C_USERNAME || !(await verifyPassword(password, user.password_hash))) {
     await auditLog(env.DB, {
       action: "login.failure",
       details: { username, ip, source: "web" },
@@ -1652,6 +1835,10 @@ export async function handleWebRequest(request, env, ctx = null) {
   const url = new URL(request.url);
 
   try {
+    if (url.pathname === "/api/webhooks/1c-events") {
+      return await handleOneCWebhook(env, request);
+    }
+
     if (request.method === "GET" && url.pathname === "/login") {
       const user = await getCurrentUser(request, env);
       return user ? redirect("/app") : await renderLogin(env);

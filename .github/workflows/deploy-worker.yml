@@ -49,6 +49,9 @@ jobs:
         run: |
           printf "%s" "$BOT_TOKEN" | npx wrangler secret put BOT_TOKEN
           printf "%s" "$WEBHOOK_SECRET" | npx wrangler secret put WEBHOOK_SECRET
+          if [ -n "$ONE_C_WEBHOOK_TOKEN" ]; then
+            printf "%s" "$ONE_C_WEBHOOK_TOKEN" | npx wrangler secret put ONE_C_WEBHOOK_TOKEN
+          fi
           printf "%s" "$ALLOWED_USERS" | npx wrangler secret put ALLOWED_USERS
           printf "%s" "$APP_BASE_URL" | npx wrangler secret put APP_BASE_URL
           printf "%s" "$SESSION_SECRET" | npx wrangler secret put SESSION_SECRET
@@ -65,6 +68,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          ONE_C_WEBHOOK_TOKEN: ${{ secrets.ONE_C_WEBHOOK_TOKEN }}
           ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
           APP_BASE_URL: ${{ secrets.APP_BASE_URL || 'https://bot.michael.kz' }}
           SESSION_SECRET: ${{ secrets.SESSION_SECRET || secrets.WEBHOOK_SECRET }}

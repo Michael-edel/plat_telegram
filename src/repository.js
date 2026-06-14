@@ -1,4 +1,4 @@
-import { TASK_STATUSES, extractHashtags } from "./utils.js";
+import { TASK_STATUSES, extractHashtags, normalizeTag } from "./utils.js";
 
 export const ENTITY_CONFIG = {
   ideas: { table: "ideas", entityType: "idea", label: "Идеи", single: "Идея" },
@@ -88,17 +88,35 @@ export async function findUsersByUsernames(db, usernames) {
   return results;
 }
 
-export async function saveTags(db, entityType, entityId, text) {
-  const tags = extractHashtags(text);
-  await db.prepare("DELETE FROM entity_tags WHERE entity_type = ? AND entity_id = ?").bind(entityType, entityId).run();
-  for (const tag of tags) {
-    const row = await db.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?) RETURNING id").bind(tag).first();
-    const tagRow = row || (await db.prepare("SELECT id FROM tags WHERE name = ?").bind(tag).first());
+export async function findUserByUsername(db, username) {
+  const cleanUsername = String(username || "").trim().toLowerCase();
+  if (!cleanUsername) {
+    return null;
+  }
+  return await db
+    .prepare("SELECT id, username, role, telegram_id, display_name, is_active FROM users WHERE lower(username) = ? AND is_active = 1")
+    .bind(cleanUsername)
+    .first();
+}
+
+export async function addEntityTags(db, entityType, entityId, tags) {
+  const cleanTags = [...new Set((tags || []).map((tag) => normalizeTag(String(tag || ""))).filter(Boolean))];
+  if (!cleanTags.length) {
+    return;
+  }
+  for (const cleanTag of cleanTags) {
+    const row = await db.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?) RETURNING id").bind(cleanTag).first();
+    const tagRow = row || (await db.prepare("SELECT id FROM tags WHERE name = ?").bind(cleanTag).first());
     await db
       .prepare("INSERT OR IGNORE INTO entity_tags (entity_type, entity_id, tag_id) VALUES (?, ?, ?)")
       .bind(entityType, entityId, tagRow.id)
       .run();
   }
+}
+
+export async function saveTags(db, entityType, entityId, text) {
+  await db.prepare("DELETE FROM entity_tags WHERE entity_type = ? AND entity_id = ?").bind(entityType, entityId).run();
+  await addEntityTags(db, entityType, entityId, extractHashtags(text));
 }
 
 function searchContent(entityType, row) {
@@ -122,7 +140,7 @@ export async function syncSearchIndex(db, { entityType, entityId, projectId, con
   }
 }
 
-async function removeSearchIndex(db, entityType, entityId) {
+export async function removeSearchIndex(db, entityType, entityId) {
   try {
     await db.prepare("DELETE FROM search_index WHERE entity_type = ? AND entity_id = ?").bind(entityType, entityId).run();
   } catch (error) {
@@ -192,6 +210,49 @@ export async function getOrCreateProject(db, name, userId = null, source = "web"
     details: { name: cleanName, source },
   });
   return project;
+}
+
+export async function getProjectByName(db, name) {
+  const cleanName = String(name || "").trim();
+  if (!cleanName) {
+    return null;
+  }
+  return await db.prepare("SELECT * FROM projects WHERE name = ?").bind(cleanName).first();
+}
+
+function writeCount(result) {
+  return Number(result?.meta?.changes ?? result?.meta?.rows_written ?? 0);
+}
+
+export async function reserve1CEvent(db, eventId) {
+  const result = await db
+    .prepare("INSERT OR IGNORE INTO processed_1c_events (event_id, status, created_at) VALUES (?, 'processing', CURRENT_TIMESTAMP)")
+    .bind(eventId)
+    .run();
+  return writeCount(result) > 0;
+}
+
+export async function getProcessed1CEvent(db, eventId) {
+  return await db
+    .prepare("SELECT event_id, entity_type, entity_id, status, error_message, processed_at FROM processed_1c_events WHERE event_id = ?")
+    .bind(eventId)
+    .first();
+}
+
+export async function mark1CEventProcessed(db, { eventId, entityType, entityId }) {
+  await db
+    .prepare(
+      "UPDATE processed_1c_events SET status = 'processed', entity_type = ?, entity_id = ?, error_message = NULL, processed_at = CURRENT_TIMESTAMP WHERE event_id = ?",
+    )
+    .bind(entityType, entityId, eventId)
+    .run();
+}
+
+export async function mark1CEventFailed(db, { eventId, errorMessage }) {
+  await db
+    .prepare("UPDATE processed_1c_events SET status = 'failed', error_message = ?, processed_at = CURRENT_TIMESTAMP WHERE event_id = ?")
+    .bind(previewText(errorMessage, 500), eventId)
+    .run();
 }
 
 export async function listProjects(db, dueSoonDays = 3, tzModifier = "+0 hours") {
@@ -807,6 +868,131 @@ export async function softDeleteLink(db, { linkId, projectId, userId }) {
   });
   await changeLog(db, { userId, entityType: "link", entityId: linkId, fieldName: "deleted", oldValue: "0", newValue: "1" });
   await removeSearchIndex(db, "link", linkId);
+}
+
+function convertibleTable(entityType) {
+  if (entityType === "idea") return "ideas";
+  if (entityType === "link") return "links";
+  return "";
+}
+
+function convertibleText(entityType, row) {
+  if (entityType === "link") {
+    return `${row.url || ""}${row.description ? ` ${row.description}` : ""}`.trim();
+  }
+  return String(row.text || "").trim();
+}
+
+export async function getConvertibleEntity(db, entityType, entityId) {
+  const table = convertibleTable(entityType);
+  if (!table) {
+    throw new Error("Некорректный тип сущности");
+  }
+  const id = Number.parseInt(entityId, 10);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error("Некорректный id сущности");
+  }
+  const columns = entityType === "link" ? "id, project_id, url, description, is_deleted" : "id, project_id, text, is_deleted";
+  return await db.prepare(`SELECT ${columns} FROM ${table} WHERE id = ?`).bind(id).first();
+}
+
+export async function transferEntityTags(db, sourceType, sourceId, targetType, targetId) {
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO entity_tags (entity_type, entity_id, tag_id)
+       SELECT ?, ?, tag_id
+       FROM entity_tags
+       WHERE entity_type = ? AND entity_id = ?`,
+    )
+    .bind(targetType, targetId, sourceType, sourceId)
+    .run();
+}
+
+export async function convertEntityToTask(db, { entityType, entityId, userId }) {
+  const table = convertibleTable(entityType);
+  if (!table) {
+    throw new Error("Некорректный тип сущности");
+  }
+  const source = await getConvertibleEntity(db, entityType, entityId);
+  if (!source || source.is_deleted) {
+    return { alreadyDeleted: true };
+  }
+
+  const text = convertibleText(entityType, source);
+  const task = await createTask(db, {
+    projectId: source.project_id,
+    text,
+    authorId: userId,
+    source: "telegram_inline",
+  });
+  await transferEntityTags(db, entityType, source.id, "task", task.id);
+  await db
+    .prepare(`UPDATE ${table} SET is_deleted = 1, deleted_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND is_deleted = 0`)
+    .bind(source.id)
+    .run();
+  await removeSearchIndex(db, entityType, source.id);
+  await auditLog(db, {
+    userId,
+    action: "convert_to_task",
+    entityType,
+    entityId: source.id,
+    details: { project_id: source.project_id, task_id: task.id, source: "telegram_inline" },
+  });
+  await changeLog(db, {
+    userId,
+    entityType: "task",
+    entityId: task.id,
+    fieldName: "created_from_entity",
+    oldValue: null,
+    newValue: `${entityType}:${source.id}`,
+    eventType: "task_created_from_entity",
+    details: { source_entity_type: entityType, source_entity_id: source.id },
+  });
+  await changeLog(db, {
+    userId,
+    entityType,
+    entityId: source.id,
+    fieldName: "converted_to_task",
+    oldValue: null,
+    newValue: task.id,
+    eventType: "entity_converted_to_task",
+    details: { task_id: task.id },
+  });
+  return { task, source };
+}
+
+export async function archiveEntity(db, { entityType, entityId, userId }) {
+  const table = convertibleTable(entityType);
+  if (!table) {
+    throw new Error("Некорректный тип сущности");
+  }
+  const source = await getConvertibleEntity(db, entityType, entityId);
+  if (!source || source.is_deleted) {
+    return { alreadyDeleted: true };
+  }
+  await db
+    .prepare(`UPDATE ${table} SET is_deleted = 1, deleted_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND is_deleted = 0`)
+    .bind(source.id)
+    .run();
+  await removeSearchIndex(db, entityType, source.id);
+  await auditLog(db, {
+    userId,
+    action: "archive_entity",
+    entityType,
+    entityId: source.id,
+    details: { project_id: source.project_id, source: "telegram_inline" },
+  });
+  await changeLog(db, {
+    userId,
+    entityType,
+    entityId: source.id,
+    fieldName: "archived",
+    oldValue: "0",
+    newValue: "1",
+    eventType: "entity_archived",
+    details: { source: "telegram_inline" },
+  });
+  return { source };
 }
 
 function ftsQuery(value) {

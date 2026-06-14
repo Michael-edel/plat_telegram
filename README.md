@@ -211,6 +211,7 @@ Settings -> Secrets and variables -> Actions -> New repository secret
 - `BOT_TOKEN` - token Telegram-бота.
 - `ALLOWED_USERS` - Telegram user_id через запятую, например `111111111,222222222`.
 - `WEBHOOK_SECRET` - произвольная секретная строка для проверки Telegram webhook.
+- `ONE_C_WEBHOOK_TOKEN` - секрет для входящего webhook из 1С.
 - `WEBHOOK_URL` - полный URL webhook: `https://bot.michael.kz/telegram/webhook`.
 - `APP_BASE_URL` - базовый адрес web panel для deep links: `https://bot.michael.kz`.
 - `SESSION_SECRET` - длинный секрет для подписи web sessions и CSRF.
@@ -221,7 +222,45 @@ Settings -> Secrets and variables -> Actions -> New repository secret
 - `AUDIT_RETENTION_DAYS` - сколько дней хранить аудит и историю изменений, по умолчанию `90`.
 - `TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID` - необязательный общий чат/канал для уведомлений о статусах и дедлайнах.
 
-Workflow сам загрузит `BOT_TOKEN`, `WEBHOOK_SECRET`, `ALLOWED_USERS`, `APP_BASE_URL`, `SESSION_SECRET`, `INITIAL_ADMIN_USERNAME`, `INITIAL_ADMIN_PASSWORD`, `TASK_DUE_SOON_HOURS`, `APP_TIMEZONE_OFFSET_HOURS`, `AUDIT_RETENTION_DAYS` и, если задан, `TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID` в Worker secrets через Wrangler.
+Workflow сам загрузит `BOT_TOKEN`, `WEBHOOK_SECRET`, `ONE_C_WEBHOOK_TOKEN`, `ALLOWED_USERS`, `APP_BASE_URL`, `SESSION_SECRET`, `INITIAL_ADMIN_USERNAME`, `INITIAL_ADMIN_PASSWORD`, `TASK_DUE_SOON_HOURS`, `APP_TIMEZONE_OFFSET_HOURS`, `AUDIT_RETENTION_DAYS` и, если задан, `TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID` в Worker secrets через Wrangler.
+
+## 1С Inbound Webhook
+
+Endpoint для создания задач из 1С:
+
+```text
+POST https://bot.michael.kz/api/webhooks/1c-events
+X-1C-Webhook-Token: значение ONE_C_WEBHOOK_TOKEN
+Content-Type: application/json
+```
+
+Пример payload:
+
+```json
+{
+  "event_id": "1c-task-000001",
+  "event_type": "task_created",
+  "project_name": "Основной проект",
+  "payload": {
+    "text": "Проверить обмен с 1С #интеграция",
+    "priority": "normal",
+    "due_date": "2026-06-20",
+    "assignee_username": "manager",
+    "tags": ["1c", "обмен"]
+  }
+}
+```
+
+Поддерживается идемпотентность по `event_id`: повторно обработанное событие не создаст вторую задачу. Проект должен уже существовать в базе, автоматическое создание проектов из 1С в этом релизе не выполняется.
+
+## Telegram Inline Actions
+
+После команд `/idea текст` и `/link url описание` бот показывает кнопки:
+
+- `Создать задачу` - конвертирует идею или ссылку в задачу того же проекта, переносит теги и архивирует исходную запись.
+- `В архив` - мягко удаляет идею или ссылку без создания задачи.
+
+Действия доступны только пользователям из `ALLOWED_USERS`, у которых в web panel есть активная роль `admin`, `manager` или `editor`.
 
 ## Деплой через GitHub
 
