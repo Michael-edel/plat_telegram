@@ -10,7 +10,7 @@
 - Cloudflare D1 хранит проекты, активный проект чата, идеи, задачи, ссылки, заметки, решения и теги.
 - Wrangler деплоит Worker и применяет D1 migrations.
 - GitHub Actions запускает тесты, применяет миграции, деплоит Worker и настраивает Telegram webhook.
-- Scheduled Trigger каждые 30 минут проверяет дедлайны задач и отправляет Telegram-уведомления.
+- Scheduled Trigger каждые 30 минут проверяет дедлайны задач, отправляет Telegram-уведомления и очищает старый аудит.
 
 ## Команды бота
 
@@ -33,6 +33,7 @@
 - `/find [query]` - поиск по текущему проекту
 
 Команды `/idea`, `/task`, `/note`, `/decision` и `/link` поддерживают reply-режим.
+После создания задачи бот показывает inline-кнопки для перевода задачи в `doing`, `review` и `done`; команды `/task_doing`, `/task_review` и `/task_done` оставлены для совместимости.
 
 ## Веб-панель и роли
 
@@ -71,6 +72,7 @@ https://bot.michael.kz/login
 - фильтры проекта по статусу, автору, ответственному, приоритету, дедлайну и тегу;
 - фильтр истории изменений по типу сущности и пользователю;
 - обзор рисков: просроченные задачи и задачи с ближайшим дедлайном;
+- расчёт дедлайнов с учётом локального часового пояса приложения;
 - поиск по проекту с учётом выбранного тега;
 - отображение тегов на карточках задач, идей, заметок, решений и ссылок;
 - смена статуса задачи через select;
@@ -83,6 +85,8 @@ https://bot.michael.kz/login
 - просмотр и восстановление мягко удалённых записей для `admin`;
 - экспорт проекта в Markdown, CSV и JSON;
 - Telegram-уведомления о назначении ответственного, смене статуса, ближайшем дедлайне и просрочке;
+- Telegram inline-кнопки для быстрой смены статуса задач;
+- фоновая отправка уведомлений через `ctx.waitUntil()`, чтобы веб-запросы и webhook отвечали быстрее;
 - JSON API для проектов, данных проекта и поиска.
 
 Маршруты:
@@ -133,9 +137,11 @@ POST /api/admin/users/:id/password
 - пароли хранятся только как PBKDF2-SHA256 hash;
 - web session хранится в signed HttpOnly cookie;
 - POST-формы защищены CSRF token;
+- `/login` ограничивает частые неудачные попытки входа по IP;
 - write routes проверяют роли на backend;
 - viewer не видит кнопки создания, редактирования, удаления и смены статуса;
 - действия записываются в `audit_log`.
+- старые записи `audit_log` и `change_log` очищаются по `AUDIT_RETENTION_DAYS`.
 
 Первый admin создаётся автоматически при первом обращении к панели, если таблица `users` пустая и заданы secrets:
 
@@ -199,9 +205,11 @@ Settings -> Secrets and variables -> Actions -> New repository secret
 - `INITIAL_ADMIN_USERNAME` - логин первого admin, если `users` ещё пустая.
 - `INITIAL_ADMIN_PASSWORD` - пароль первого admin, если `users` ещё пустая.
 - `TASK_DUE_SOON_HOURS` - окно ближайшего дедлайна в часах, по умолчанию `24`.
+- `APP_TIMEZONE_OFFSET_HOURS` - смещение локального времени для расчёта дедлайнов, по умолчанию `5`.
+- `AUDIT_RETENTION_DAYS` - сколько дней хранить аудит и историю изменений, по умолчанию `90`.
 - `TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID` - необязательный общий чат/канал для уведомлений о статусах и дедлайнах.
 
-Workflow сам загрузит `BOT_TOKEN`, `WEBHOOK_SECRET`, `ALLOWED_USERS`, `SESSION_SECRET`, `INITIAL_ADMIN_USERNAME`, `INITIAL_ADMIN_PASSWORD`, `TASK_DUE_SOON_HOURS` и, если задан, `TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID` в Worker secrets через Wrangler.
+Workflow сам загрузит `BOT_TOKEN`, `WEBHOOK_SECRET`, `ALLOWED_USERS`, `SESSION_SECRET`, `INITIAL_ADMIN_USERNAME`, `INITIAL_ADMIN_PASSWORD`, `TASK_DUE_SOON_HOURS`, `APP_TIMEZONE_OFFSET_HOURS`, `AUDIT_RETENTION_DAYS` и, если задан, `TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID` в Worker secrets через Wrangler.
 
 ## Деплой через GitHub
 

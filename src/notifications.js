@@ -1,4 +1,4 @@
-import { auditLog } from "./repository.js";
+import { auditLog, timezoneModifier } from "./repository.js";
 import { parseAllowedUsers, truncateText } from "./utils.js";
 
 const DEFAULT_DUE_SOON_HOURS = 24;
@@ -120,6 +120,7 @@ export async function notifyTaskStatusChanged(env, taskId, oldStatus, newStatus)
 }
 
 async function dueTaskRows(env, mode) {
+  const tzModifier = timezoneModifier(env);
   if (mode === "soon") {
     const days = notificationWindowDays(env);
     return await env.DB
@@ -133,12 +134,12 @@ async function dueTaskRows(env, mode) {
            AND t.status != 'done'
            AND t.due_date IS NOT NULL
            AND t.due_soon_notified_at IS NULL
-           AND date(t.due_date) >= date('now')
-           AND date(t.due_date) <= date('now', '+' || ? || ' days')
+           AND date(t.due_date) >= date('now', ?)
+           AND date(t.due_date) <= date('now', ?, '+' || ? || ' days')
          ORDER BY t.due_date ASC
          LIMIT 50`,
       )
-      .bind(days)
+      .bind(tzModifier, tzModifier, days)
       .all();
   }
   return await env.DB
@@ -152,10 +153,11 @@ async function dueTaskRows(env, mode) {
          AND t.status != 'done'
          AND t.due_date IS NOT NULL
          AND t.overdue_notified_at IS NULL
-         AND date(t.due_date) < date('now')
+         AND date(t.due_date) < date('now', ?)
        ORDER BY t.due_date ASC
        LIMIT 50`,
     )
+    .bind(tzModifier)
     .all();
 }
 
@@ -201,4 +203,18 @@ export async function runTaskDeadlineNotifications(env) {
   }
 
   return { checked: soon.results.length + overdue.results.length, sent };
+}
+
+export async function cleanupAuditLog(env) {
+  const value = Number.parseInt(env.AUDIT_RETENTION_DAYS || "", 10);
+  const retentionDays = Number.isInteger(value) && value > 0 ? value : 90;
+  const [audit, changes] = await Promise.all([
+    env.DB.prepare("DELETE FROM audit_log WHERE created_at < datetime('now', '-' || ? || ' days')").bind(retentionDays).run(),
+    env.DB.prepare("DELETE FROM change_log WHERE created_at < datetime('now', '-' || ? || ' days')").bind(retentionDays).run(),
+  ]);
+  return {
+    auditDeleted: audit.meta?.changes || 0,
+    changesDeleted: changes.meta?.changes || 0,
+    retentionDays,
+  };
 }

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { createCsrfToken, hashPassword, verifyCsrfToken, verifyPassword } from "../src/auth.js";
+import { timezoneModifier } from "../src/repository.js";
 import { commandPayload, extractHashtags, isTaskStatus, isValidUrl, parseAllowedUsers } from "../src/utils.js";
 
 test("extractHashtags returns unique lower-case tags", () => {
@@ -35,6 +36,12 @@ test("isTaskStatus accepts only known task states", () => {
   assert.equal(isTaskStatus("review"), true);
   assert.equal(isTaskStatus("done"), true);
   assert.equal(isTaskStatus("blocked"), false);
+});
+
+test("timezoneModifier formats sqlite hour offsets", () => {
+  assert.equal(timezoneModifier({ APP_TIMEZONE_OFFSET_HOURS: "5" }), "+5 hours");
+  assert.equal(timezoneModifier({ APP_TIMEZONE_OFFSET_HOURS: "-3" }), "-3 hours");
+  assert.equal(timezoneModifier({ APP_TIMEZONE_OFFSET_HOURS: "bad" }), "+0 hours");
 });
 
 test("password hashes verify only matching passwords", async () => {

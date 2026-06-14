@@ -110,6 +110,14 @@ function bindOptional(statement, bindings) {
   return bindings.length ? statement.bind(...bindings) : statement;
 }
 
+export function timezoneModifier(env = {}) {
+  const offset = Number.parseInt(env.APP_TIMEZONE_OFFSET_HOURS || "", 10);
+  if (!Number.isInteger(offset) || offset === 0) {
+    return "+0 hours";
+  }
+  return `${offset > 0 ? "+" : ""}${offset} hours`;
+}
+
 export async function getOrCreateProject(db, name, userId = null, source = "web") {
   const cleanName = name.trim();
   if (!cleanName) {
@@ -135,7 +143,7 @@ export async function getOrCreateProject(db, name, userId = null, source = "web"
   return project;
 }
 
-export async function listProjects(db, dueSoonDays = 3) {
+export async function listProjects(db, dueSoonDays = 3, tzModifier = "+0 hours") {
   const { results } = await db
     .prepare(
       `SELECT
@@ -150,14 +158,14 @@ export async function listProjects(db, dueSoonDays = 3) {
         (SELECT COUNT(*) FROM notes WHERE project_id = p.id AND is_deleted = 0) AS notes_count,
         (SELECT COUNT(*) FROM decisions WHERE project_id = p.id AND is_deleted = 0) AS decisions_count,
         (SELECT COUNT(*) FROM links WHERE project_id = p.id AND is_deleted = 0) AS links_count,
-        (SELECT COUNT(*) FROM tasks WHERE project_id = p.id AND is_deleted = 0 AND status != 'done' AND due_date IS NOT NULL AND date(due_date) < date('now')) AS overdue_count,
-        (SELECT COUNT(*) FROM tasks WHERE project_id = p.id AND is_deleted = 0 AND status != 'done' AND due_date IS NOT NULL AND date(due_date) >= date('now') AND date(due_date) <= date('now', '+' || ? || ' days')) AS due_soon_count
+        (SELECT COUNT(*) FROM tasks WHERE project_id = p.id AND is_deleted = 0 AND status != 'done' AND due_date IS NOT NULL AND date(due_date) < date('now', ?)) AS overdue_count,
+        (SELECT COUNT(*) FROM tasks WHERE project_id = p.id AND is_deleted = 0 AND status != 'done' AND due_date IS NOT NULL AND date(due_date) >= date('now', ?) AND date(due_date) <= date('now', ?, '+' || ? || ' days')) AS due_soon_count
       FROM projects p
       LEFT JOIN tasks t ON t.project_id = p.id
       GROUP BY p.id
       ORDER BY p.name`,
     )
-    .bind(dueSoonDays)
+    .bind(tzModifier, tzModifier, tzModifier, dueSoonDays)
     .all();
   return results;
 }
@@ -170,7 +178,7 @@ function authorSelect(alias = "u") {
   return `COALESCE(${alias}.display_name, ${alias}.username, '—') AS author_name`;
 }
 
-export async function loadProjectData(db, projectId, filters = {}) {
+export async function loadProjectData(db, projectId, filters = {}, tzModifier = "+0 hours") {
   const taskFilters = addProjectFilters(["t.project_id = ?", "t.is_deleted = 0"], filters, "t", "task");
   const ideaFilters = addProjectFilters(["i.project_id = ?", "i.is_deleted = 0"], filters, "i", "idea");
   const noteFilters = addProjectFilters(["n.project_id = ?", "n.is_deleted = 0"], filters, "n", "note");
@@ -194,13 +202,16 @@ export async function loadProjectData(db, projectId, filters = {}) {
     taskFilters.whereSql += " AND t.due_date IS NULL";
   }
   if (filters.deadline === "today") {
-    taskFilters.whereSql += " AND date(t.due_date) = date('now')";
+    taskFilters.whereSql += " AND date(t.due_date) = date('now', ?)";
+    taskFilters.bindings.push(tzModifier);
   }
   if (filters.deadline === "week") {
-    taskFilters.whereSql += " AND t.due_date IS NOT NULL AND date(t.due_date) >= date('now') AND date(t.due_date) <= date('now', '+7 days')";
+    taskFilters.whereSql += " AND t.due_date IS NOT NULL AND date(t.due_date) >= date('now', ?) AND date(t.due_date) <= date('now', ?, '+7 days')";
+    taskFilters.bindings.push(tzModifier, tzModifier);
   }
   if (filters.deadline === "overdue") {
-    taskFilters.whereSql += " AND t.due_date IS NOT NULL AND date(t.due_date) < date('now') AND t.status != 'done'";
+    taskFilters.whereSql += " AND t.due_date IS NOT NULL AND date(t.due_date) < date('now', ?) AND t.status != 'done'";
+    taskFilters.bindings.push(tzModifier);
   }
 
   const [tasks, ideas, notes, decisions, links] = await Promise.all([

@@ -45,6 +45,8 @@ jobs:
           printf "%s" "$INITIAL_ADMIN_USERNAME" | npx wrangler secret put INITIAL_ADMIN_USERNAME
           printf "%s" "$INITIAL_ADMIN_PASSWORD" | npx wrangler secret put INITIAL_ADMIN_PASSWORD
           printf "%s" "$TASK_DUE_SOON_HOURS" | npx wrangler secret put TASK_DUE_SOON_HOURS
+          printf "%s" "$APP_TIMEZONE_OFFSET_HOURS" | npx wrangler secret put APP_TIMEZONE_OFFSET_HOURS
+          printf "%s" "$AUDIT_RETENTION_DAYS" | npx wrangler secret put AUDIT_RETENTION_DAYS
           if [ -n "$TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID" ]; then
             printf "%s" "$TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID" | npx wrangler secret put TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID
           fi
@@ -58,6 +60,8 @@ jobs:
           INITIAL_ADMIN_USERNAME: ${{ secrets.INITIAL_ADMIN_USERNAME || secrets.PANEL_USERNAME }}
           INITIAL_ADMIN_PASSWORD: ${{ secrets.INITIAL_ADMIN_PASSWORD || secrets.PANEL_PASSWORD }}
           TASK_DUE_SOON_HOURS: ${{ secrets.TASK_DUE_SOON_HOURS || '24' }}
+          APP_TIMEZONE_OFFSET_HOURS: ${{ secrets.APP_TIMEZONE_OFFSET_HOURS || '5' }}
+          AUDIT_RETENTION_DAYS: ${{ secrets.AUDIT_RETENTION_DAYS || '90' }}
           TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID: ${{ secrets.TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID }}
 
       - name: Configure Telegram webhook

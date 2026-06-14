@@ -37,6 +37,7 @@ import {
   softDeleteTask,
   softDeleteTextEntity,
   TASK_PRIORITIES,
+  timezoneModifier,
   updateLink,
   updateTaskMeta,
   updateTaskStatus,
@@ -51,6 +52,8 @@ const ENTITY_PATHS = {
   notes: ENTITY_CONFIG.notes,
   decisions: ENTITY_CONFIG.decisions,
 };
+const LOGIN_RATE_LIMIT_WINDOW_MINUTES = 10;
+const LOGIN_RATE_LIMIT_MAX_FAILURES = 8;
 
 function html(body, init = {}) {
   return new Response(body, {
@@ -80,6 +83,45 @@ function textResponse(body, contentType, init = {}) {
       ...(init.headers || {}),
     },
   });
+}
+
+async function scheduleBackground(ctx, promise) {
+  if (ctx?.waitUntil) {
+    ctx.waitUntil(promise);
+    return;
+  }
+  await promise;
+}
+
+function localDateString(env, daysOffset = 0) {
+  const offset = Number.parseInt(env.APP_TIMEZONE_OFFSET_HOURS || "", 10);
+  const offsetHours = Number.isInteger(offset) ? offset : 0;
+  return new Date(Date.now() + (offsetHours * 60 * 60 + daysOffset * 24 * 60 * 60) * 1000).toISOString().slice(0, 10);
+}
+
+function likeEscape(value) {
+  return String(value || "").replace(/[\\%_]/g, "\\$&");
+}
+
+function clientIp(request) {
+  return request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For")?.split(",", 1)[0]?.trim() || "unknown";
+}
+
+async function isLoginRateLimited(env, ip) {
+  if (!ip || ip === "unknown") {
+    return false;
+  }
+  const row = await env.DB
+    .prepare(
+      `SELECT COUNT(*) AS count
+       FROM audit_log
+       WHERE action = 'login.failure'
+         AND created_at >= datetime('now', '-' || ? || ' minutes')
+         AND details_json LIKE ? ESCAPE '\\'`,
+    )
+    .bind(LOGIN_RATE_LIMIT_WINDOW_MINUTES, `%"ip":"${likeEscape(ip)}"%`)
+    .first();
+  return Number(row?.count || 0) >= LOGIN_RATE_LIMIT_MAX_FAILURES;
 }
 
 function redirect(location, headers = new Headers()) {
@@ -908,7 +950,7 @@ function projectCsv(project, data) {
 async function handleProjectExport(env, user, projectId, format) {
   const project = await getProject(env.DB, projectId);
   if (!project) return renderErrorPage("Проект не найден", 404);
-  const data = await loadProjectData(env.DB, projectId);
+  const data = await loadProjectData(env.DB, projectId, {}, timezoneModifier(env));
   const headers = new Headers();
   if (format === "json") {
     headers.set("content-disposition", `attachment; filename="${projectFileName(project, "json")}"`);
@@ -928,6 +970,15 @@ async function handleLogin(request, env) {
     return await renderLogin(env, "Сессия формы устарела. Повторите вход.");
   }
 
+  const ip = clientIp(request);
+  if (await isLoginRateLimited(env, ip)) {
+    await auditLog(env.DB, {
+      action: "login.rate_limited",
+      details: { ip, source: "web" },
+    });
+    return await renderLogin(env, `Слишком много попыток входа. Повторите через ${LOGIN_RATE_LIMIT_WINDOW_MINUTES} минут.`);
+  }
+
   const username = String(data.username || "").trim();
   const password = String(data.password || "");
   const user = await env.DB
@@ -938,13 +989,13 @@ async function handleLogin(request, env) {
   if (!user || !user.is_active || !(await verifyPassword(password, user.password_hash))) {
     await auditLog(env.DB, {
       action: "login.failure",
-      details: { username, source: "web" },
+      details: { username, ip, source: "web" },
     });
     return await renderLogin(env, "Неверный логин или пароль.");
   }
 
   await env.DB.prepare("UPDATE users SET last_login_at = datetime('now'), updated_at = datetime('now') WHERE id = ?").bind(user.id).run();
-  await auditLog(env.DB, { userId: user.id, action: "login.success", details: { source: "web" } });
+  await auditLog(env.DB, { userId: user.id, action: "login.success", details: { ip, source: "web" } });
   const headers = new Headers();
   appendSetCookie(headers, await createSessionCookie(env, user));
   return redirect("/app", headers);
@@ -959,27 +1010,28 @@ async function handleLogout(request, env, user) {
   return redirect("/login", headers);
 }
 
-async function handleDashboard(env, user) {
-  await runTaskDeadlineNotifications(env);
+async function handleDashboard(env, user, ctx) {
+  await scheduleBackground(ctx, runTaskDeadlineNotifications(env));
   const riskWindowDays = dueSoonDays(env);
-  const projects = await listProjects(env.DB, riskWindowDays);
+  const projects = await listProjects(env.DB, riskWindowDays, timezoneModifier(env));
   const csrfToken = await createCsrfToken(env);
   const headers = new Headers();
   appendSetCookie(headers, createCsrfCookie(csrfToken));
   return html(renderLayout({ title: "Проекты", content: renderDashboard(projects, user, csrfToken, riskWindowDays), user, csrfToken }), { headers });
 }
 
-async function handleProjectPage(env, request, user, projectId) {
+async function handleProjectPage(env, request, user, projectId, ctx) {
   const project = await getProject(env.DB, projectId);
   if (!project) return renderErrorPage("Проект не найден", 404);
   const url = new URL(request.url);
   const filters = projectFilterParams(url);
-  await runTaskDeadlineNotifications(env);
+  await scheduleBackground(ctx, runTaskDeadlineNotifications(env));
   const riskWindowDays = dueSoonDays(env);
-  const today = new Date().toISOString().slice(0, 10);
-  const dueSoonDate = new Date(Date.now() + riskWindowDays * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const today = localDateString(env);
+  const dueSoonDate = localDateString(env, riskWindowDays);
+  const tzModifier = timezoneModifier(env);
   const [data, searchResults, authors, tags, assignableUsers, changes] = await Promise.all([
-    loadProjectData(env.DB, project.id, filters),
+    loadProjectData(env.DB, project.id, filters, tzModifier),
     filters.q ? searchProject(env.DB, project.id, filters.q, filters) : Promise.resolve([]),
     listProjectAuthors(env.DB, project.id),
     listProjectTags(env.DB, project.id),
@@ -1002,7 +1054,7 @@ async function handleCreateProject(env, request, user) {
   return redirect(projectRedirect(project.id));
 }
 
-async function handleCreateTask(env, request, user) {
+async function handleCreateTask(env, request, user, ctx) {
   if (!canWrite(user)) return forbiddenResponse(false);
   const data = await readRequestData(request);
   await requireCsrf(request, env, data);
@@ -1016,17 +1068,17 @@ async function handleCreateTask(env, request, user) {
     dueDate: String(data.due_date || ""),
     assigneeId: data.assignee_id,
   });
-  await notifyTaskAssigned(env, task.id, null, task.assignee_id);
+  await scheduleBackground(ctx, notifyTaskAssigned(env, task.id, null, task.assignee_id));
   return redirect(projectRedirect(projectId));
 }
 
-async function handleTaskStatus(env, request, user, taskId) {
+async function handleTaskStatus(env, request, user, taskId, ctx) {
   if (!canWrite(user)) return forbiddenResponse(false);
   const data = await readRequestData(request);
   await requireCsrf(request, env, data);
   const projectId = Number.parseInt(data.project_id, 10);
   const result = await updateTaskStatus(env.DB, { taskId, projectId, status: String(data.status || ""), userId: user.id });
-  await notifyTaskStatusChanged(env, result.taskId, result.oldStatus, result.newStatus);
+  await scheduleBackground(ctx, notifyTaskStatusChanged(env, result.taskId, result.oldStatus, result.newStatus));
   return redirect(projectRedirect(projectId));
 }
 
@@ -1039,7 +1091,7 @@ async function handleTaskEdit(env, request, user, taskId) {
   return redirect(projectRedirect(projectId));
 }
 
-async function handleTaskMeta(env, request, user, taskId) {
+async function handleTaskMeta(env, request, user, taskId, ctx) {
   if (!canWrite(user)) return forbiddenResponse(false);
   const data = await readRequestData(request);
   await requireCsrf(request, env, data);
@@ -1052,7 +1104,7 @@ async function handleTaskMeta(env, request, user, taskId) {
     assigneeId: data.assignee_id,
     userId: user.id,
   });
-  await notifyTaskAssigned(env, result.taskId, result.oldAssigneeId, result.newAssigneeId);
+  await scheduleBackground(ctx, notifyTaskAssigned(env, result.taskId, result.oldAssigneeId, result.newAssigneeId));
   return redirect(projectRedirect(projectId));
 }
 
@@ -1251,9 +1303,9 @@ async function handleUserPassword(env, request, user, targetId) {
   return redirect("/app/users");
 }
 
-async function handleApi(env, request, url, user) {
+async function handleApi(env, request, url, user, ctx) {
   if (request.method === "GET" && url.pathname === "/api/projects") {
-    return json({ projects: await listProjects(env.DB) });
+    return json({ projects: await listProjects(env.DB, dueSoonDays(env), timezoneModifier(env)) });
   }
 
   const projectMatch = url.pathname.match(/^\/api\/projects\/(\d+)$/);
@@ -1261,7 +1313,7 @@ async function handleApi(env, request, url, user) {
     const projectId = Number.parseInt(projectMatch[1], 10);
     const project = await getProject(env.DB, projectId);
     if (!project) return json({ error: "Project not found" }, { status: 404 });
-    return json({ project, data: await loadProjectData(env.DB, projectId) });
+    return json({ project, data: await loadProjectData(env.DB, projectId, {}, timezoneModifier(env)) });
   }
 
   if (request.method === "GET" && url.pathname === "/api/search") {
@@ -1364,7 +1416,7 @@ async function handleApi(env, request, url, user) {
       dueDate: String(data.due_date || ""),
       assigneeId: data.assignee_id,
     });
-    await notifyTaskAssigned(env, task.id, null, task.assignee_id);
+    await scheduleBackground(ctx, notifyTaskAssigned(env, task.id, null, task.assignee_id));
     return json({ task }, { status: 201 });
   }
 
@@ -1374,7 +1426,7 @@ async function handleApi(env, request, url, user) {
     const projectId = Number.parseInt(data.project_id, 10);
     if (taskAction[2] === "status") {
       const result = await updateTaskStatus(env.DB, { taskId, projectId, status: String(data.status || ""), userId: user.id });
-      await notifyTaskStatusChanged(env, result.taskId, result.oldStatus, result.newStatus);
+      await scheduleBackground(ctx, notifyTaskStatusChanged(env, result.taskId, result.oldStatus, result.newStatus));
     }
     if (taskAction[2] === "meta") {
       const result = await updateTaskMeta(env.DB, {
@@ -1385,7 +1437,7 @@ async function handleApi(env, request, url, user) {
         assigneeId: data.assignee_id,
         userId: user.id,
       });
-      await notifyTaskAssigned(env, result.taskId, result.oldAssigneeId, result.newAssigneeId);
+      await scheduleBackground(ctx, notifyTaskAssigned(env, result.taskId, result.oldAssigneeId, result.newAssigneeId));
     }
     if (taskAction[2] === "edit") await updateTaskText(env.DB, { taskId, projectId, text: String(data.text || ""), userId: user.id });
     if (taskAction[2] === "delete") await softDeleteTask(env.DB, { taskId, projectId, userId: user.id });
@@ -1453,7 +1505,7 @@ async function handleApi(env, request, url, user) {
   return json({ error: "Not found" }, { status: 404 });
 }
 
-export async function handleWebRequest(request, env) {
+export async function handleWebRequest(request, env, ctx = null) {
   const url = new URL(request.url);
 
   try {
@@ -1473,10 +1525,10 @@ export async function handleWebRequest(request, env) {
     }
 
     if (request.method === "POST" && url.pathname === "/logout") return await handleLogout(request, env, user);
-    if (url.pathname.startsWith("/api/")) return await handleApi(env, request, url, user);
+    if (url.pathname.startsWith("/api/")) return await handleApi(env, request, url, user, ctx);
 
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/app" || url.pathname === "/app/projects")) {
-      return await handleDashboard(env, user);
+      return await handleDashboard(env, user, ctx);
     }
 
     const exportMatch = url.pathname.match(/^\/app\/projects\/(\d+)\/export\.(json|csv|md)$/);
@@ -1486,7 +1538,7 @@ export async function handleWebRequest(request, env) {
 
     const projectMatch = url.pathname.match(/^\/app\/projects\/(\d+)$/);
     if (request.method === "GET" && projectMatch) {
-      return await handleProjectPage(env, request, user, Number.parseInt(projectMatch[1], 10));
+      return await handleProjectPage(env, request, user, Number.parseInt(projectMatch[1], 10), ctx);
     }
 
     if (request.method === "GET" && url.pathname === "/app/users") return await handleUsersPage(env, request, user);
@@ -1494,13 +1546,13 @@ export async function handleWebRequest(request, env) {
     if (request.method === "GET" && url.pathname === "/app/audit") return await handleAuditPage(env, request, user);
 
     if (request.method === "POST" && url.pathname === "/app/projects") return await handleCreateProject(env, request, user);
-    if (request.method === "POST" && url.pathname === "/app/tasks") return await handleCreateTask(env, request, user);
+    if (request.method === "POST" && url.pathname === "/app/tasks") return await handleCreateTask(env, request, user, ctx);
 
     const taskAction = url.pathname.match(/^\/app\/tasks\/(\d+)\/(status|meta|edit|delete)$/);
     if (request.method === "POST" && taskAction) {
       const taskId = Number.parseInt(taskAction[1], 10);
-      if (taskAction[2] === "status") return await handleTaskStatus(env, request, user, taskId);
-      if (taskAction[2] === "meta") return await handleTaskMeta(env, request, user, taskId);
+      if (taskAction[2] === "status") return await handleTaskStatus(env, request, user, taskId, ctx);
+      if (taskAction[2] === "meta") return await handleTaskMeta(env, request, user, taskId, ctx);
       if (taskAction[2] === "edit") return await handleTaskEdit(env, request, user, taskId);
       return await handleTaskDelete(env, request, user, taskId);
     }

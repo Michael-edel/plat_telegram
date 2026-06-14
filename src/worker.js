@@ -6,7 +6,7 @@ import {
   truncateText,
 } from "./utils.js";
 import { handleWebRequest } from "./web.js";
-import { notifyTaskStatusChanged, runTaskDeadlineNotifications } from "./notifications.js";
+import { cleanupAuditLog, notifyTaskStatusChanged, runTaskDeadlineNotifications } from "./notifications.js";
 import {
   createLink,
   createTask,
@@ -26,7 +26,7 @@ function json(data, init = {}) {
   });
 }
 
-async function sendMessage(env, chatId, text) {
+async function sendMessage(env, chatId, text, options = {}) {
   const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -34,12 +34,72 @@ async function sendMessage(env, chatId, text) {
       chat_id: chatId,
       text: truncateText(text),
       disable_web_page_preview: true,
+      ...options,
     }),
   });
 
   if (!response.ok) {
     console.error("Telegram sendMessage failed", response.status, await response.text());
   }
+}
+
+async function answerCallbackQuery(env, callbackQueryId, text) {
+  if (!callbackQueryId) return;
+  const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/answerCallbackQuery`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      callback_query_id: callbackQueryId,
+      text: truncateText(text, 180),
+    }),
+  });
+
+  if (!response.ok) {
+    console.error("Telegram answerCallbackQuery failed", response.status, await response.text());
+  }
+}
+
+async function editMessageText(env, chatId, messageId, text, options = {}) {
+  if (!chatId || !messageId) return;
+  const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/editMessageText`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId,
+      text: truncateText(text),
+      disable_web_page_preview: true,
+      ...options,
+    }),
+  });
+
+  if (!response.ok) {
+    console.error("Telegram editMessageText failed", response.status, await response.text());
+  }
+}
+
+function taskKeyboard(taskId) {
+  return {
+    inline_keyboard: [
+      [
+        { text: "В работе", callback_data: `task:doing:${taskId}` },
+        { text: "В ревью", callback_data: `task:review:${taskId}` },
+        { text: "Готово", callback_data: `task:done:${taskId}` },
+      ],
+    ],
+  };
+}
+
+function taskSummary(task, projectName, authorName = "—") {
+  return `Задача #${task.id} создана в проекте ${projectName}. Статус: ${task.status || "todo"}. Автор: ${authorName}`;
+}
+
+async function scheduleBackground(ctx, promise) {
+  if (ctx?.waitUntil) {
+    ctx.waitUntil(promise);
+    return;
+  }
+  await promise;
 }
 
 function isAllowed(env, userId) {
@@ -168,7 +228,9 @@ async function handleTask(env, message, user) {
     authorId: user?.id || null,
     source: "telegram",
   });
-  await sendMessage(env, message.chat.id, `Задача #${task.id} создана в проекте ${project.name}. Статус: todo. Автор: ${user?.username || message.from.username || message.from.first_name || "—"}`);
+  await sendMessage(env, message.chat.id, taskSummary(task, project.name, user?.username || message.from.username || message.from.first_name || "—"), {
+    reply_markup: taskKeyboard(task.id),
+  });
 }
 
 async function handleTasks(env, message) {
@@ -189,7 +251,7 @@ async function handleTasks(env, message) {
   await sendMessage(env, message.chat.id, lines.join("\n"));
 }
 
-async function handleTaskStatusCommand(env, message, user, status, commandName) {
+async function handleTaskStatusCommand(env, message, user, status, commandName, ctx = null) {
   const payload = commandPayload(message);
   const taskId = Number.parseInt(payload, 10);
   if (!Number.isInteger(taskId)) {
@@ -208,7 +270,7 @@ async function handleTaskStatusCommand(env, message, user, status, commandName) 
       userId: user?.id || null,
       source: "telegram",
     });
-    await notifyTaskStatusChanged(env, result.taskId, result.oldStatus, result.newStatus);
+    await scheduleBackground(ctx, notifyTaskStatusChanged(env, result.taskId, result.oldStatus, result.newStatus));
   } catch {
     await sendMessage(env, message.chat.id, "Задача не найдена в текущем проекте.");
     return;
@@ -216,8 +278,63 @@ async function handleTaskStatusCommand(env, message, user, status, commandName) 
   await sendMessage(env, message.chat.id, `Задача #${taskId} в проекте ${project.name}: статус ${status}.`);
 }
 
-async function handleTaskDone(env, message, user) {
-  await handleTaskStatusCommand(env, message, user, "done", "task_done");
+async function handleTaskDone(env, message, user, ctx = null) {
+  await handleTaskStatusCommand(env, message, user, "done", "task_done", ctx);
+}
+
+async function handleTaskCallback(env, callbackQuery, ctx = null) {
+  const userId = callbackQuery.from?.id;
+  if (!isAllowed(env, userId)) {
+    await answerCallbackQuery(env, callbackQuery.id, "Доступ закрыт.");
+    return;
+  }
+
+  const match = String(callbackQuery.data || "").match(/^task:(doing|review|done):(\d+)$/);
+  if (!match) {
+    await answerCallbackQuery(env, callbackQuery.id, "Неизвестное действие.");
+    return;
+  }
+
+  const status = match[1];
+  const taskId = Number.parseInt(match[2], 10);
+  const task = await env.DB
+    .prepare(
+      `SELECT t.id, t.text, t.status, t.project_id, p.name AS project_name
+       FROM tasks t
+       JOIN projects p ON p.id = t.project_id
+       WHERE t.id = ? AND t.is_deleted = 0`,
+    )
+    .bind(taskId)
+    .first();
+
+  if (!task) {
+    await answerCallbackQuery(env, callbackQuery.id, "Задача не найдена.");
+    return;
+  }
+
+  const user = await findUserByTelegramId(env.DB, userId);
+  let result;
+  try {
+    result = await updateTaskStatus(env.DB, {
+      taskId,
+      projectId: task.project_id,
+      status,
+      userId: user?.id || null,
+      source: "telegram_button",
+    });
+  } catch {
+    await answerCallbackQuery(env, callbackQuery.id, "Не удалось изменить статус задачи.");
+    return;
+  }
+  await scheduleBackground(ctx, notifyTaskStatusChanged(env, result.taskId, result.oldStatus, result.newStatus));
+  await answerCallbackQuery(env, callbackQuery.id, `Статус: ${status}`);
+
+  const message = callbackQuery.message;
+  if (message?.chat?.id && message.message_id) {
+    await editMessageText(env, message.chat.id, message.message_id, `Задача #${task.id} в проекте ${task.project_name}: ${task.text}\nСтатус: ${status}.`, {
+      reply_markup: taskKeyboard(task.id),
+    });
+  }
 }
 
 async function handleNote(env, message, user) {
@@ -322,7 +439,12 @@ async function handleFind(env, message) {
   await sendMessage(env, message.chat.id, results.length ? `Найдено:\n${results.join("\n")}` : "Ничего не найдено.");
 }
 
-async function handleTelegramUpdate(env, update) {
+async function handleTelegramUpdate(env, update, ctx = null) {
+  if (update.callback_query) {
+    await handleTaskCallback(env, update.callback_query, ctx);
+    return;
+  }
+
   const message = update.message || update.edited_message;
   if (!message || !message.chat || !message.from) {
     return;
@@ -361,13 +483,13 @@ async function handleTelegramUpdate(env, update) {
       await handleTasks(env, message);
       break;
     case "/task_doing":
-      await handleTaskStatusCommand(env, message, user, "doing", "task_doing");
+      await handleTaskStatusCommand(env, message, user, "doing", "task_doing", ctx);
       break;
     case "/task_review":
-      await handleTaskStatusCommand(env, message, user, "review", "task_review");
+      await handleTaskStatusCommand(env, message, user, "review", "task_review", ctx);
       break;
     case "/task_done":
-      await handleTaskDone(env, message, user);
+      await handleTaskDone(env, message, user, ctx);
       break;
     case "/ideas":
       await handleEntityList(env, message, "ideas", "Идеи");
@@ -399,11 +521,12 @@ async function handleTelegramUpdate(env, update) {
 }
 
 export default {
-  async scheduled(_event, env, _ctx) {
-    await runTaskDeadlineNotifications(env);
+  async scheduled(_event, env, ctx) {
+    ctx.waitUntil(runTaskDeadlineNotifications(env));
+    ctx.waitUntil(cleanupAuditLog(env));
   },
 
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (url.pathname === "/health") {
@@ -417,7 +540,7 @@ export default {
       url.pathname.startsWith("/app") ||
       url.pathname.startsWith("/api")
     ) {
-      return await handleWebRequest(request, env);
+      return await handleWebRequest(request, env, ctx);
     }
 
     if (url.pathname !== "/telegram/webhook") {
@@ -436,7 +559,7 @@ export default {
     }
 
     const update = await request.json();
-    await handleTelegramUpdate(env, update);
+    await handleTelegramUpdate(env, update, ctx);
     return json({ ok: true });
   },
 };
