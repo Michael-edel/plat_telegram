@@ -230,6 +230,25 @@ async function getActiveProject(db, chatId) {
     .first();
 }
 
+async function setPendingChatAction(db, chatId, action) {
+  await db
+    .prepare(
+      "INSERT INTO telegram_chat_state (chat_id, pending_action, created_at, updated_at) VALUES (?, ?, datetime('now'), datetime('now')) " +
+        "ON CONFLICT(chat_id) DO UPDATE SET pending_action = excluded.pending_action, updated_at = datetime('now')",
+    )
+    .bind(chatId, action)
+    .run();
+}
+
+async function getPendingChatAction(db, chatId) {
+  const row = await db.prepare("SELECT pending_action FROM telegram_chat_state WHERE chat_id = ?").bind(chatId).first();
+  return row?.pending_action || "";
+}
+
+async function clearPendingChatAction(db, chatId) {
+  await db.prepare("DELETE FROM telegram_chat_state WHERE chat_id = ?").bind(chatId).run();
+}
+
 async function requireActiveProject(env, message) {
   const project = await getActiveProject(env.DB, message.chat.id);
   if (!project) {
@@ -286,12 +305,36 @@ async function handleStart(env, message) {
 async function handleProjectSet(env, message) {
   const name = commandPayload(message);
   if (!name) {
-    await sendMessage(env, message.chat.id, "Укажите название проекта: /project_set название");
+    await setPendingChatAction(env.DB, message.chat.id, "project_set");
+    await sendMessage(env, message.chat.id, "Укажите название проекта следующим сообщением или одной командой: /project_set название");
     return;
   }
 
   const project = await setActiveProject(env.DB, message.chat.id, name);
+  await clearPendingChatAction(env.DB, message.chat.id);
   await sendMessage(env, message.chat.id, `Активный проект: ${project.name}`);
+}
+
+async function handlePendingChatAction(env, message) {
+  const action = await getPendingChatAction(env.DB, message.chat.id);
+  if (!action) return false;
+
+  const text = String(message.text || message.caption || "").trim();
+  if (!text) return false;
+  if (text.startsWith("/")) {
+    await clearPendingChatAction(env.DB, message.chat.id);
+    return false;
+  }
+
+  if (action === "project_set") {
+    const project = await setActiveProject(env.DB, message.chat.id, text);
+    await clearPendingChatAction(env.DB, message.chat.id);
+    await sendMessage(env, message.chat.id, `Активный проект: ${project.name}`);
+    return true;
+  }
+
+  await clearPendingChatAction(env.DB, message.chat.id);
+  return false;
 }
 
 async function handleProjects(env, message) {
@@ -898,6 +941,9 @@ async function handleTelegramUpdate(env, update, ctx = null) {
   }
 
   const user = await findUserByTelegramId(env.DB, message.from.id);
+  if (await handlePendingChatAction(env, message)) {
+    return;
+  }
 
   if (message.voice || message.audio) {
     await handleAudioIntake(env, message, user);
