@@ -201,14 +201,18 @@ function forbiddenResponse(isApi) {
   return isApi ? json({ error: "Forbidden" }, { status: 403 }) : renderErrorPage("Недостаточно прав", 403);
 }
 
-async function renderPage(env, user, { title, content }) {
+async function renderPage(env, user, { title, content, navProjectId = "" }) {
   const csrfToken = await createCsrfToken(env);
   const headers = new Headers();
   appendSetCookie(headers, createCsrfCookie(csrfToken));
-  return html(renderLayout({ title, content, user, csrfToken }), { headers });
+  return html(renderLayout({ title, content, user, csrfToken, navProjectId }), { headers });
 }
 
-function renderLayout({ title, content, user, csrfToken }) {
+function projectSectionHref(navProjectId, sectionId) {
+  return navProjectId ? `/app/projects/${encodeURIComponent(navProjectId)}#${sectionId}` : "/app";
+}
+
+function renderLayout({ title, content, user, csrfToken, navProjectId = "" }) {
   const managementLinks = [
     canManageProjects(user) ? `<a href="/app/integrations/1c">1С события</a>` : "",
     isAdmin(user) ? `<a href="/app/users">Пользователи</a><a href="/app/deleted">Удалённые</a><a href="/app/audit">Аудит</a>` : "",
@@ -360,12 +364,12 @@ function renderLayout({ title, content, user, csrfToken }) {
       </div>
       <nav class="nav" aria-label="Основная навигация">
         <a href="/app">Проекты</a>
-        <a href="/app#tasks">Задачи</a>
-        <a href="/app#ideas">Идеи</a>
-        <a href="/app#notes">Заметки</a>
-        <a href="/app#decisions">Решения</a>
-        <a href="/app#links">Ссылки</a>
-        <a href="/app#search">Поиск</a>
+        <a href="${projectSectionHref(navProjectId, "tasks")}">Задачи</a>
+        <a href="${projectSectionHref(navProjectId, "ideas")}">Идеи</a>
+        <a href="${projectSectionHref(navProjectId, "notes")}">Заметки</a>
+        <a href="${projectSectionHref(navProjectId, "decisions")}">Решения</a>
+        <a href="${projectSectionHref(navProjectId, "links")}">Ссылки</a>
+        <a href="${projectSectionHref(navProjectId, "search")}">Поиск</a>
         ${managementLinks}
         <form method="post" action="/logout">
           <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
@@ -509,6 +513,14 @@ function renderDashboard(projects, user, csrfToken, riskWindowDays) {
               <p class="muted">Задачи: todo ${Number(project.todo_count || 0)}, doing ${Number(project.doing_count || 0)}, review ${Number(project.review_count || 0)}, done ${Number(project.done_count || 0)}</p>
               <p class="muted">Идеи ${Number(project.ideas_count || 0)} · Заметки ${Number(project.notes_count || 0)} · Решения ${Number(project.decisions_count || 0)} · Ссылки ${Number(project.links_count || 0)}</p>
               <p>${Number(project.overdue_count || 0) ? `<span class="badge danger-badge">Просрочено: ${Number(project.overdue_count || 0)}</span>` : `<span class="badge">Просрочено: 0</span>`} <span class="badge">Дедлайн ≤ ${riskWindowDays} дн.: ${Number(project.due_soon_count || 0)}</span></p>
+              <div class="inline-form">
+                <a class="button secondary" href="/app/projects/${project.id}#tasks">Задачи</a>
+                <a class="button secondary" href="/app/projects/${project.id}#ideas">Идеи</a>
+                <a class="button secondary" href="/app/projects/${project.id}#notes">Заметки</a>
+                <a class="button secondary" href="/app/projects/${project.id}#decisions">Решения</a>
+                <a class="button secondary" href="/app/projects/${project.id}#links">Ссылки</a>
+                <a class="button secondary" href="/app/projects/${project.id}#search">Поиск</a>
+              </div>
             </div>
             <a class="button" href="/app/projects/${project.id}">Открыть</a>
           </article>`,
@@ -530,6 +542,11 @@ function renderDashboard(projects, user, csrfToken, riskWindowDays) {
   return `<div class="topbar">
       <div><h1>Проекты</h1><p class="muted">Рабочая панель проектной базы.</p></div>
     </div>
+    ${
+      projects.length
+        ? `<div class="notice">Для задач, идей, заметок, решений, ссылок и поиска сначала откройте нужный проект или используйте быстрые ссылки в карточке проекта.</div>`
+        : ""
+    }
     <section class="stats">
       <div class="stat"><strong>${totals.todo}</strong><span>todo</span></div>
       <div class="stat"><strong>${totals.doing}</strong><span>doing</span></div>
@@ -1369,10 +1386,11 @@ async function handleDashboard(env, user, ctx) {
   await scheduleBackground(ctx, runTaskDeadlineNotifications(env));
   const riskWindowDays = dueSoonDays(env);
   const projects = await listProjects(env.DB, riskWindowDays, timezoneModifier(env));
+  const navProjectId = projects[0]?.id || "";
   const csrfToken = await createCsrfToken(env);
   const headers = new Headers();
   appendSetCookie(headers, createCsrfCookie(csrfToken));
-  return html(renderLayout({ title: "Проекты", content: renderDashboard(projects, user, csrfToken, riskWindowDays), user, csrfToken }), { headers });
+  return html(renderLayout({ title: "Проекты", content: renderDashboard(projects, user, csrfToken, riskWindowDays), user, csrfToken, navProjectId }), { headers });
 }
 
 async function handleProjectPage(env, request, user, projectId, ctx) {
@@ -1396,7 +1414,7 @@ async function handleProjectPage(env, request, user, projectId, ctx) {
   const csrfToken = await createCsrfToken(env);
   const headers = new Headers();
   appendSetCookie(headers, createCsrfCookie(csrfToken));
-  return html(renderLayout({ title: project.name, content: renderProject(project, data, searchResults, filters, { authors, tags, assignableUsers, changes, today, dueSoonDate, riskWindowDays }, user, csrfToken), user, csrfToken }), {
+  return html(renderLayout({ title: project.name, content: renderProject(project, data, searchResults, filters, { authors, tags, assignableUsers, changes, today, dueSoonDate, riskWindowDays }, user, csrfToken), user, csrfToken, navProjectId: project.id }), {
     headers,
   });
 }
