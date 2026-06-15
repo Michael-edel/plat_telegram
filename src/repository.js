@@ -239,6 +239,39 @@ export async function getProcessed1CEvent(db, eventId) {
     .first();
 }
 
+export async function list1CEvents(db, filters = {}, limit = 100) {
+  const conditions = [];
+  const bindings = [];
+  const status = String(filters.status || "").trim();
+  const eventId = String(filters.eventId || "").trim();
+  if (["processing", "processed", "failed"].includes(status)) {
+    conditions.push("e.status = ?");
+    bindings.push(status);
+  }
+  if (eventId) {
+    conditions.push("e.event_id LIKE ? ESCAPE '\\'");
+    bindings.push(`%${eventId.replaceAll("%", "\\%").replaceAll("_", "\\_")}%`);
+  }
+  const whereSql = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  const { results } = await db
+    .prepare(
+      `SELECT e.event_id, e.entity_type, e.entity_id, e.status, e.error_message, e.processed_at, e.created_at,
+              CASE
+                WHEN e.status = 'processing' AND e.created_at < datetime('now', '-10 minutes') THEN 1
+                ELSE 0
+              END AS is_stale_processing,
+              t.project_id AS task_project_id
+       FROM processed_1c_events e
+       LEFT JOIN tasks t ON e.entity_type = 'task' AND e.entity_id = t.id
+       ${whereSql}
+       ORDER BY e.created_at DESC
+       LIMIT ?`,
+    )
+    .bind(...bindings, limit)
+    .all();
+  return results;
+}
+
 export async function mark1CEventProcessed(db, { eventId, entityType, entityId }) {
   await db
     .prepare(
@@ -908,7 +941,7 @@ export async function transferEntityTags(db, sourceType, sourceId, targetType, t
     .run();
 }
 
-export async function convertEntityToTask(db, { entityType, entityId, userId }) {
+export async function convertEntityToTask(db, { entityType, entityId, userId, projectId = null }) {
   const table = convertibleTable(entityType);
   if (!table) {
     throw new Error("Некорректный тип сущности");
@@ -916,6 +949,9 @@ export async function convertEntityToTask(db, { entityType, entityId, userId }) 
   const source = await getConvertibleEntity(db, entityType, entityId);
   if (!source || source.is_deleted) {
     return { alreadyDeleted: true };
+  }
+  if (projectId && Number(source.project_id) !== Number(projectId)) {
+    throw new Error("Запись не найдена в проекте");
   }
 
   const text = convertibleText(entityType, source);

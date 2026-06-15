@@ -59,6 +59,14 @@ https://bot.michael.kz/login
 - `editor` - просмотр, создание и редактирование рабочих записей, смена статуса задач.
 - `viewer` - только просмотр и поиск.
 
+### Роль manager
+
+`manager` - рабочая роль менеджера проекта. Она предназначена для управления проектами и задачами без доступа к администрированию пользователей и secrets.
+
+Manager может создавать проекты, вести задачи, менять статусы, сроки, приоритеты и ответственных, работать с идеями, заметками, решениями и ссылками, конвертировать идеи/ссылки в задачи, смотреть журнал входящих 1С-событий.
+
+Manager не может создавать пользователей, менять роли, менять пароли, отключать пользователей и управлять секретами.
+
 Возможности:
 
 - список проектов;
@@ -82,10 +90,12 @@ https://bot.michael.kz/login
 - смена статуса задачи через select;
 - создание задач, идей, заметок, решений и ссылок;
 - просмотр ссылок с открытием в новой вкладке;
+- конвертация идеи или ссылки в задачу из web panel с переносом тегов;
 - поиск по текущему проекту;
 - управление пользователями для `admin` с фильтрами по роли и активности;
 - отображение `telegram_id` и `last_login_at` в пользователях;
 - аудит действий для `admin` с фильтрами по пользователю, действию и типу сущности;
+- журнал 1С-событий для `admin` и `manager`;
 - просмотр и восстановление мягко удалённых записей для `admin`;
 - экспорт проекта в Markdown, CSV и JSON;
 - Telegram-уведомления о назначении ответственного, смене статуса, ближайшем дедлайне и просрочке;
@@ -105,6 +115,7 @@ GET  /app/projects/:id/export.md
 GET  /app/projects/:id/export.csv
 GET  /app/projects/:id/export.json
 GET  /app/users
+GET  /app/integrations/1c
 GET  /app/deleted
 GET  /app/audit
 POST /app/projects
@@ -119,6 +130,7 @@ POST /app/comments/:id/delete
 POST /app/ideas
 POST /app/ideas/:id/edit
 POST /app/ideas/:id/delete
+POST /app/ideas/:id/convert-task
 POST /app/notes
 POST /app/notes/:id/edit
 POST /app/notes/:id/delete
@@ -128,11 +140,13 @@ POST /app/decisions/:id/delete
 POST /app/links
 POST /app/links/:id/edit
 POST /app/links/:id/delete
+POST /app/links/:id/convert-task
 POST /app/deleted/:entity_type/:id/restore
 
 GET  /api/projects
 GET  /api/projects/:id
 GET  /api/search?project_id=1&q=...
+GET  /api/integrations/1c/events
 GET  /api/admin/users
 GET  /api/admin/audit
 POST /api/admin/users
@@ -253,6 +267,40 @@ Content-Type: application/json
 
 Поддерживается идемпотентность по `event_id`: повторно обработанное событие не создаст вторую задачу. Проект должен уже существовать в базе, автоматическое создание проектов из 1С в этом релизе не выполняется.
 
+Создать `ONE_C_WEBHOOK_TOKEN` можно как любую длинную случайную строку. Это не Cloudflare API token и не Telegram token. Значение нужно сохранить в GitHub Actions secret `ONE_C_WEBHOOK_TOKEN`, workflow загрузит его в Worker secrets.
+
+Пример проверки через `curl`:
+
+```bash
+curl -X POST "https://bot.michael.kz/api/webhooks/1c-events" \
+  -H "Content-Type: application/json" \
+  -H "X-1C-Webhook-Token: $ONE_C_WEBHOOK_TOKEN" \
+  -d '{
+    "event_id": "1c-task-000001",
+    "event_type": "task_created",
+    "project_name": "Основной проект",
+    "payload": {
+      "text": "Проверить обмен с 1С #интеграция",
+      "priority": "normal",
+      "tags": ["обмен"]
+    }
+  }'
+```
+
+Если endpoint возвращает `503 Webhook is not configured`, значит Worker не видит secret `ONE_C_WEBHOOK_TOKEN`. Проверьте:
+
+- secret добавлен в GitHub: `Settings -> Secrets and variables -> Actions`;
+- workflow `Deploy Cloudflare Worker` после этого был запущен заново;
+- шаг `Upload Worker secrets` завершился успешно.
+
+Журнал событий доступен в web panel:
+
+```text
+https://bot.michael.kz/app/integrations/1c
+```
+
+Доступ к журналу есть у `admin` и `manager`.
+
 ## Telegram Inline Actions
 
 После команд `/idea текст` и `/link url описание` бот показывает кнопки:
@@ -261,6 +309,18 @@ Content-Type: application/json
 - `В архив` - мягко удаляет идею или ссылку без создания задачи.
 
 Действия доступны только пользователям из `ALLOWED_USERS`, у которых в web panel есть активная роль `admin`, `manager` или `editor`.
+
+## Web Actions для идей и ссылок
+
+В web panel на карточках идей и ссылок есть действие `Создать задачу`.
+
+При конвертации:
+
+- создаётся задача в том же проекте;
+- теги исходной идеи/ссылки переносятся в задачу;
+- исходная идея/ссылка отправляется в архив через soft delete;
+- поисковый индекс обновляется;
+- открывается проект с фокусом на новой задаче.
 
 ## Деплой через GitHub
 
@@ -275,6 +335,14 @@ Workflow `.github/workflows/deploy-worker.yml` выполнит:
 5. `wrangler deploy`
 6. `wrangler secret put ...`
 7. `node scripts/set-webhook.mjs`
+
+Статус деплоя проверяется в GitHub:
+
+```text
+Repository -> Actions -> Deploy Cloudflare Worker
+```
+
+Последний запуск должен быть зелёным. Если он красный, откройте failed job и проверьте шаги `Run tests`, `Apply D1 migrations`, `Deploy Worker` и `Upload Worker secrets`.
 
 ## FTS seed
 

@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import { createCsrfToken, hashPassword, verifyCsrfToken, verifyPassword } from "../src/auth.js";
 import { timezoneModifier } from "../src/repository.js";
 import { commandPayload, extractHashtags, extractMentions, isTaskStatus, isValidUrl, parseAllowedUsers, taskWebUrl, truncateTelegramText } from "../src/utils.js";
+import { canTelegramWrite, parseEntityActionCallback } from "../src/worker.js";
+import { handleOneCWebhook, validateOneCEnvelope, validateOneCTaskPayload } from "../src/web.js";
 
 test("extractHashtags returns unique lower-case tags", () => {
   assert.deepEqual(extractHashtags("Идея #AI #бот #ai #Бот"), ["ai", "бот"]);
@@ -72,4 +74,97 @@ test("csrf token verifies without a cookie", async () => {
 
   assert.equal(await verifyCsrfToken(request, env, token), true);
   assert.equal(await verifyCsrfToken(request, env, "bad-token"), false);
+});
+
+test("parseEntityActionCallback accepts only known inline entity actions", () => {
+  assert.deepEqual(parseEntityActionCallback("convert_to_task:idea:12"), { action: "convert_to_task", entityType: "idea", entityId: 12 });
+  assert.deepEqual(parseEntityActionCallback("convert_to_task:link:7"), { action: "convert_to_task", entityType: "link", entityId: 7 });
+  assert.deepEqual(parseEntityActionCallback("archive_entity:idea:3"), { action: "archive_entity", entityType: "idea", entityId: 3 });
+  assert.deepEqual(parseEntityActionCallback("archive_entity:link:4"), { action: "archive_entity", entityType: "link", entityId: 4 });
+  assert.equal(parseEntityActionCallback("archive_entity:note:4"), null);
+  assert.equal(parseEntityActionCallback("convert_to_task:idea:0"), null);
+  assert.equal(parseEntityActionCallback("convert_to_task:idea:bad"), null);
+});
+
+test("viewer cannot perform Telegram write callbacks", () => {
+  assert.equal(canTelegramWrite({ is_active: 1, role: "admin" }), true);
+  assert.equal(canTelegramWrite({ is_active: 1, role: "manager" }), true);
+  assert.equal(canTelegramWrite({ is_active: 1, role: "editor" }), true);
+  assert.equal(canTelegramWrite({ is_active: 1, role: "viewer" }), false);
+  assert.equal(canTelegramWrite({ is_active: 0, role: "admin" }), false);
+});
+
+test("1C webhook validation rejects malformed envelopes and tag payloads", () => {
+  assert.equal(validateOneCEnvelope({ event_id: "short", event_type: "task_created", payload: {} }).error, "event_id must be 8..128 characters");
+  assert.equal(validateOneCEnvelope({ event_id: "event-0001", event_type: "task_created", payload: [] }).error, "payload object is required");
+  assert.equal(validateOneCTaskPayload({ text: "" }), "payload.text is required");
+  assert.equal(validateOneCTaskPayload({ text: "task", tags: "bad" }), "payload.tags must be an array");
+  assert.equal(validateOneCTaskPayload({ text: "task", tags: ["ok", 123] }), "payload.tags must contain only strings");
+  assert.equal(validateOneCTaskPayload({ text: "task", tags: ["ok"] }), "");
+});
+
+test("1C webhook returns controlled config/auth/json errors", async () => {
+  const noToken = await handleOneCWebhook({}, new Request("https://bot.example/api/webhooks/1c-events", { method: "POST", body: "{}" }));
+  assert.equal(noToken.status, 503);
+
+  const wrongToken = await handleOneCWebhook(
+    { ONE_C_WEBHOOK_TOKEN: "secret" },
+    new Request("https://bot.example/api/webhooks/1c-events", {
+      method: "POST",
+      headers: { "X-1C-Webhook-Token": "wrong" },
+      body: "{}",
+    }),
+  );
+  assert.equal(wrongToken.status, 401);
+
+  const invalidJson = await handleOneCWebhook(
+    { ONE_C_WEBHOOK_TOKEN: "secret" },
+    new Request("https://bot.example/api/webhooks/1c-events", {
+      method: "POST",
+      headers: { "X-1C-Webhook-Token": "secret" },
+      body: "{bad",
+    }),
+  );
+  assert.equal(invalidJson.status, 400);
+});
+
+function mockD1WithProcessedEvent(event) {
+  return {
+    prepare(sql) {
+      return {
+        bind(...bindings) {
+          return {
+            async run() {
+              if (sql.includes("INSERT OR IGNORE INTO processed_1c_events")) {
+                return { meta: { changes: 0, rows_written: 0 } };
+              }
+              return { meta: { changes: 1, rows_written: 1 } };
+            },
+            async first() {
+              if (sql.includes("SELECT event_id, entity_type, entity_id, status")) {
+                return event;
+              }
+              throw new Error(`Unexpected first SQL: ${sql} ${bindings.join(",")}`);
+            },
+          };
+        },
+      };
+    },
+  };
+}
+
+test("1C webhook duplicate processed and failed events are idempotent", async () => {
+  const body = JSON.stringify({ event_id: "event-0001", event_type: "task_created", project_id: 1, payload: { text: "task" } });
+  const processed = await handleOneCWebhook(
+    { ONE_C_WEBHOOK_TOKEN: "secret", DB: mockD1WithProcessedEvent({ status: "processed", entity_type: "task", entity_id: 42 }) },
+    new Request("https://bot.example/api/webhooks/1c-events", { method: "POST", headers: { "X-1C-Webhook-Token": "secret" }, body }),
+  );
+  assert.equal(processed.status, 200);
+  assert.equal((await processed.json()).task_id, 42);
+
+  const failed = await handleOneCWebhook(
+    { ONE_C_WEBHOOK_TOKEN: "secret", DB: mockD1WithProcessedEvent({ status: "failed", error_message: "Project not found" }) },
+    new Request("https://bot.example/api/webhooks/1c-events", { method: "POST", headers: { "X-1C-Webhook-Token": "secret" }, body }),
+  );
+  assert.equal(failed.status, 409);
 });

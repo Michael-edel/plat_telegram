@@ -136,7 +136,7 @@ function isAllowed(env, userId) {
   return allowedUsers.size === 0 || allowedUsers.has(userId);
 }
 
-function canTelegramWrite(user) {
+export function canTelegramWrite(user) {
   return Boolean(user?.is_active && TELEGRAM_WRITE_ROLES.has(user.role));
 }
 
@@ -148,7 +148,7 @@ function parseTaskStatusCallback(data) {
   return { status: match[1], taskId };
 }
 
-function parseEntityActionCallback(data) {
+export function parseEntityActionCallback(data) {
   const match = String(data || "").match(/^(convert_to_task|archive_entity):(idea|link):(\d+)$/);
   if (!match) return null;
   const entityId = Number.parseInt(match[3], 10);

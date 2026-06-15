@@ -19,6 +19,7 @@ import {
   addEntityTags,
   auditLog,
   changeLog,
+  convertEntityToTask,
   createTaskComment,
   createLink,
   createTask,
@@ -32,6 +33,7 @@ import {
   getUser,
   listAssignableUsers,
   listAudit,
+  list1CEvents,
   listDeletedEntities,
   listProjectChanges,
   listProjectAuthors,
@@ -207,9 +209,10 @@ async function renderPage(env, user, { title, content }) {
 }
 
 function renderLayout({ title, content, user, csrfToken }) {
-  const adminLinks = isAdmin(user)
-    ? `<a href="/app/users">Пользователи</a><a href="/app/deleted">Удалённые</a><a href="/app/audit">Аудит</a>`
-    : "";
+  const managementLinks = [
+    canManageProjects(user) ? `<a href="/app/integrations/1c">1С события</a>` : "",
+    isAdmin(user) ? `<a href="/app/users">Пользователи</a><a href="/app/deleted">Удалённые</a><a href="/app/audit">Аудит</a>` : "",
+  ].join("");
   return `<!doctype html>
 <html lang="ru">
 <head>
@@ -363,7 +366,7 @@ function renderLayout({ title, content, user, csrfToken }) {
         <a href="/app#decisions">Решения</a>
         <a href="/app#links">Ссылки</a>
         <a href="/app#search">Поиск</a>
-        ${adminLinks}
+        ${managementLinks}
         <form method="post" action="/logout">
           <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
           <button class="logout-button" type="submit">Выйти</button>
@@ -474,6 +477,7 @@ function projectFilterParams(url) {
     changeUserId: Number.isInteger(changeUserId) ? changeUserId : "",
     changeEntityType: ["", "task", "idea", "note", "decision", "link"].includes(changeEntityType) ? changeEntityType : "",
     focusTaskId: Number.isInteger(focusTaskId) && focusTaskId > 0 ? focusTaskId : "",
+    convertedTaskId: Number.parseInt(url.searchParams.get("converted_task") || "", 10) || "",
     tag: cleanFilter(url.searchParams.get("tag")).replace(/^#/, "").toLowerCase(),
   };
 }
@@ -661,6 +665,7 @@ function renderTextCards(items, path, projectId, user, csrfToken) {
   }
   return items
     .map((item) => {
+      const canConvert = path === "ideas";
       const actions = canWrite(user)
         ? `<form class="compact" method="post" action="/app/${path}/${item.id}/edit">
             <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
@@ -668,6 +673,15 @@ function renderTextCards(items, path, projectId, user, csrfToken) {
             <textarea name="text" required>${escapeHtml(item.text)}</textarea>
             <button class="secondary" type="submit">Сохранить</button>
           </form>
+          ${
+            canConvert
+              ? `<form method="post" action="/app/${path}/${item.id}/convert-task">
+                  <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+                  <input type="hidden" name="project_id" value="${projectId}">
+                  <button class="secondary" type="submit">Создать задачу</button>
+                </form>`
+              : ""
+          }
           <form method="post" action="/app/${path}/${item.id}/delete">
             <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
             <input type="hidden" name="project_id" value="${projectId}">
@@ -692,6 +706,11 @@ function renderLinks(items, projectId, user, csrfToken) {
             <input name="url" value="${escapeHtml(item.url)}" required>
             <input name="description" value="${escapeHtml(item.description || "")}">
             <button class="secondary" type="submit">Сохранить</button>
+          </form>
+          <form method="post" action="/app/links/${item.id}/convert-task">
+            <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+            <input type="hidden" name="project_id" value="${projectId}">
+            <button class="secondary" type="submit">Создать задачу</button>
           </form>
           <form method="post" action="/app/links/${item.id}/delete">
             <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
@@ -852,6 +871,7 @@ function renderProject(project, data, searchResults, filters, filterOptions, use
     .join("");
   const focusedTaskExists = filters.focusTaskId ? data.tasks.some((task) => String(task.id) === String(filters.focusTaskId)) : true;
   const focusNotice = filters.focusTaskId && !focusedTaskExists ? `<div class="notice">Задача #${escapeHtml(filters.focusTaskId)} не найдена в этом проекте или скрыта текущими фильтрами.</div>` : "";
+  const convertedNotice = filters.convertedTaskId ? `<div class="notice">Создана задача #${escapeHtml(filters.convertedTaskId)}.</div>` : "";
   const focusScript = filters.focusTaskId && focusedTaskExists ? `<script>document.getElementById("task-${Number(filters.focusTaskId)}")?.scrollIntoView({ block: "center" });</script>` : "";
   const overdueCount = data.tasks.filter((task) => task.status !== "done" && task.due_date && task.due_date < filterOptions.today).length;
   const dueSoonCount = data.tasks.filter(
@@ -864,6 +884,7 @@ function renderProject(project, data, searchResults, filters, filterOptions, use
     </div>
     <section class="panel" id="search">
       ${focusNotice}
+      ${convertedNotice}
       <div class="inline-form" style="margin-bottom:12px">
         <span class="badge ${overdueCount ? "danger-badge" : ""}">Просрочено: ${overdueCount}</span>
         <span class="badge ${dueSoonCount ? "warning-badge" : ""}">Дедлайн ≤ ${filterOptions.riskWindowDays} дн.: ${dueSoonCount}</span>
@@ -1025,6 +1046,48 @@ function renderDeletedPage(rows, csrfToken) {
     </section>`;
 }
 
+function render1CEventsPage(events, filters) {
+  const statusOptions = ["", "processing", "processed", "failed"]
+    .map((status) => `<option value="${status}" ${selected(status, filters.status)}>${status || "Все статусы"}</option>`)
+    .join("");
+  const filterForm = `<form class="filters" method="get" action="/app/integrations/1c">
+    <label>Статус<select name="status">${statusOptions}</select></label>
+    <label>Event ID<input name="event_id" value="${escapeHtml(filters.eventId || "")}" placeholder="event_id"></label>
+    <button type="submit">Показать</button>
+    <a class="button secondary" href="/app/integrations/1c">Сбросить</a>
+  </form>`;
+  const rows = events.length
+    ? events
+        .map((event) => {
+          const entity =
+            event.entity_type === "task" && event.entity_id && event.task_project_id
+              ? `<a href="/app/projects/${event.task_project_id}?task=${event.entity_id}">task #${event.entity_id}</a>`
+              : `${escapeHtml(event.entity_type || "—")} ${event.entity_id ? `#${escapeHtml(event.entity_id)}` : ""}`;
+          const stale = event.is_stale_processing ? ` <span class="badge warning-badge">дольше 10 минут</span>` : "";
+          return `<tr>
+            <td>${escapeHtml(event.event_id)}</td>
+            <td><span class="badge">${escapeHtml(event.status)}</span>${stale}</td>
+            <td>${entity}</td>
+            <td>${escapeHtml(event.error_message || "—")}</td>
+            <td>${escapeHtml(formatDate(event.created_at))}</td>
+            <td>${escapeHtml(formatDate(event.processed_at))}</td>
+          </tr>`;
+        })
+        .join("")
+    : `<tr><td colspan="6" class="muted">Событий пока нет.</td></tr>`;
+  return `<div class="topbar">
+      <div><h1>1С события</h1><p class="muted">Журнал входящих webhook-событий из 1С.</p></div>
+      <a class="button secondary" href="/app">Проекты</a>
+    </div>
+    <section class="panel">
+      ${filterForm}
+      <table>
+        <thead><tr><th>Event ID</th><th>Статус</th><th>Сущность</th><th>Ошибка</th><th>Создано</th><th>Обработано</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </section>`;
+}
+
 function projectMarkdown(project, data) {
   const lines = [`# ${project.name}`, "", `Создан: ${formatDate(project.created_at)}`, "", "## Задачи"];
   for (const task of data.tasks) {
@@ -1096,7 +1159,7 @@ async function readOneCEvent(request) {
   }
 }
 
-function validateOneCEnvelope(event) {
+export function validateOneCEnvelope(event) {
   const eventId = String(event?.event_id || "").trim();
   if (eventId.length < 8 || eventId.length > 128) {
     return { error: "event_id must be 8..128 characters" };
@@ -1108,6 +1171,26 @@ function validateOneCEnvelope(event) {
     return { error: "payload object is required", eventId };
   }
   return { eventId, eventType: event.event_type.trim(), payload: event.payload };
+}
+
+export function validateOneCTaskPayload(payload) {
+  const text = String(payload?.text || "").trim();
+  if (!text) {
+    return "payload.text is required";
+  }
+  if (payload.priority && !TASK_PRIORITIES.includes(String(payload.priority))) {
+    return "Invalid payload.priority";
+  }
+  if (payload.due_date && !/^\d{4}-\d{2}-\d{2}$/.test(String(payload.due_date))) {
+    return "Invalid payload.due_date";
+  }
+  if (payload.tags && !Array.isArray(payload.tags)) {
+    return "payload.tags must be an array";
+  }
+  if (Array.isArray(payload.tags) && payload.tags.some((tag) => typeof tag !== "string")) {
+    return "payload.tags must contain only strings";
+  }
+  return "";
 }
 
 async function duplicateOneCResponse(db, eventId) {
@@ -1131,7 +1214,7 @@ async function failOneCEvent(env, eventId, message, status = 400) {
   return oneCJson({ status: "error", message, event_id: eventId }, status);
 }
 
-async function handleOneCWebhook(env, request) {
+export async function handleOneCWebhook(env, request) {
   if (request.method !== "POST") {
     return oneCJson({ status: "error", message: "Method not allowed" }, 405);
   }
@@ -1170,22 +1253,11 @@ async function handleOneCWebhook(env, request) {
       return await failOneCEvent(env, eventId, "Project not found", 400);
     }
 
+    const payloadError = validateOneCTaskPayload(payload);
+    if (payloadError) {
+      return await failOneCEvent(env, eventId, payloadError, 400);
+    }
     const text = String(payload.text || "").trim();
-    if (!text) {
-      return await failOneCEvent(env, eventId, "payload.text is required", 400);
-    }
-    if (payload.priority && !TASK_PRIORITIES.includes(String(payload.priority))) {
-      return await failOneCEvent(env, eventId, "Invalid payload.priority", 400);
-    }
-    if (payload.due_date && !/^\d{4}-\d{2}-\d{2}$/.test(String(payload.due_date))) {
-      return await failOneCEvent(env, eventId, "Invalid payload.due_date", 400);
-    }
-    if (payload.tags && !Array.isArray(payload.tags)) {
-      return await failOneCEvent(env, eventId, "payload.tags must be an array", 400);
-    }
-    if (Array.isArray(payload.tags) && payload.tags.some((tag) => typeof tag !== "string")) {
-      return await failOneCEvent(env, eventId, "payload.tags must contain only strings", 400);
-    }
 
     const integrationUser = await findUserByUsername(env.DB, INTEGRATION_1C_USERNAME);
     if (!integrationUser) {
@@ -1484,6 +1556,18 @@ async function handleEntityDelete(env, request, user, config, entityId) {
   return redirect(projectRedirect(projectId));
 }
 
+async function handleEntityConvertToTask(env, request, user, entityType, entityId) {
+  if (!canWrite(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const projectId = Number.parseInt(data.project_id, 10);
+  const result = await convertEntityToTask(env.DB, { entityType, entityId, projectId, userId: user.id });
+  if (result.alreadyDeleted) {
+    return redirect(projectRedirect(projectId));
+  }
+  return redirect(`${projectRedirect(result.task.project_id, result.task.id)}&converted_task=${encodeURIComponent(result.task.id)}`);
+}
+
 async function handleCreateLink(env, request, user) {
   if (!canWrite(user)) return forbiddenResponse(false);
   const data = await readRequestData(request);
@@ -1521,6 +1605,10 @@ async function handleLinkDelete(env, request, user, linkId) {
   return redirect(projectRedirect(projectId));
 }
 
+async function handleLinkConvertToTask(env, request, user, linkId) {
+  return await handleEntityConvertToTask(env, request, user, "link", linkId);
+}
+
 async function handleUsersPage(env, request, user) {
   if (!isAdmin(user)) return forbiddenResponse(false);
   const url = new URL(request.url);
@@ -1548,6 +1636,19 @@ async function handleAuditPage(env, request, user) {
   const headers = new Headers();
   appendSetCookie(headers, createCsrfCookie(csrfToken));
   return html(renderLayout({ title: "Аудит", content: renderAuditPage(await listAudit(env.DB, filters), filters), user, csrfToken }), { headers });
+}
+
+async function handle1CEventsPage(env, request, user) {
+  if (!canManageProjects(user)) return forbiddenResponse(false);
+  const url = new URL(request.url);
+  const filters = {
+    status: ["processing", "processed", "failed"].includes(url.searchParams.get("status")) ? url.searchParams.get("status") : "",
+    eventId: cleanFilter(url.searchParams.get("event_id")),
+  };
+  const csrfToken = await createCsrfToken(env);
+  const headers = new Headers();
+  appendSetCookie(headers, createCsrfCookie(csrfToken));
+  return html(renderLayout({ title: "1С события", content: render1CEventsPage(await list1CEvents(env.DB, filters), filters), user, csrfToken }), { headers });
 }
 
 async function handleDeletedPage(env, user) {
@@ -1656,6 +1757,15 @@ async function handleApi(env, request, url, user, ctx) {
   if (request.method === "GET" && url.pathname === "/api/admin/audit") {
     if (!isAdmin(user)) return forbiddenResponse(true);
     return json({ audit: await listAudit(env.DB) });
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/integrations/1c/events") {
+    if (!canManageProjects(user)) return forbiddenResponse(true);
+    const filters = {
+      status: ["processing", "processed", "failed"].includes(url.searchParams.get("status")) ? url.searchParams.get("status") : "",
+      eventId: cleanFilter(url.searchParams.get("event_id")),
+    };
+    return json({ events: await list1CEvents(env.DB, filters) });
   }
 
   if (request.method !== "POST") return json({ error: "Not found" }, { status: 404 });
@@ -1872,6 +1982,7 @@ export async function handleWebRequest(request, env, ctx = null) {
     }
 
     if (request.method === "GET" && url.pathname === "/app/users") return await handleUsersPage(env, request, user);
+    if (request.method === "GET" && url.pathname === "/app/integrations/1c") return await handle1CEventsPage(env, request, user);
     if (request.method === "GET" && url.pathname === "/app/deleted") return await handleDeletedPage(env, user);
     if (request.method === "GET" && url.pathname === "/app/audit") return await handleAuditPage(env, request, user);
 
@@ -1907,13 +2018,18 @@ export async function handleWebRequest(request, env, ctx = null) {
         if (match[2] === "edit") return await handleEntityEdit(env, request, user, config, entityId);
         return await handleEntityDelete(env, request, user, config, entityId);
       }
+      const convertMatch = url.pathname.match(new RegExp(`^/app/${path}/(\\d+)/convert-task$`));
+      if (request.method === "POST" && convertMatch && config.entityType === "idea") {
+        return await handleEntityConvertToTask(env, request, user, config.entityType, Number.parseInt(convertMatch[1], 10));
+      }
     }
 
     if (request.method === "POST" && url.pathname === "/app/links") return await handleCreateLink(env, request, user);
-    const linkAction = url.pathname.match(/^\/app\/links\/(\d+)\/(edit|delete)$/);
+    const linkAction = url.pathname.match(/^\/app\/links\/(\d+)\/(edit|delete|convert-task)$/);
     if (request.method === "POST" && linkAction) {
       const linkId = Number.parseInt(linkAction[1], 10);
       if (linkAction[2] === "edit") return await handleLinkEdit(env, request, user, linkId);
+      if (linkAction[2] === "convert-task") return await handleLinkConvertToTask(env, request, user, linkId);
       return await handleLinkDelete(env, request, user, linkId);
     }
 
