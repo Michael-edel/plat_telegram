@@ -44,7 +44,7 @@
 - `решение: текст` или `решение текст` сохраняется в решения;
 - `заметка: текст` или любой другой текст сохраняется в заметки.
 
-Голосовые сообщения и аудио транскрибируются через OpenAI Speech-to-Text, затем проходят через те же правила авто-распределения. Для этого нужен Worker secret `OPENAI_API_KEY`.
+Голосовые сообщения и аудио транскрибируются через Gemini или OpenAI, затем проходят через те же правила авто-распределения. Если задан `GEMINI_API_KEY`, небольшие аудиофайлы до 18 MB сначала обрабатываются через Gemini; если Gemini недоступен и задан `OPENAI_API_KEY`, бот переключается на OpenAI. Для файлов до 25 MB можно использовать OpenAI как резервный или основной провайдер.
 
 ## Веб-панель и роли
 
@@ -247,8 +247,10 @@ Settings -> Secrets and variables -> Actions -> New repository secret
 - `TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID` - необязательный общий чат/канал для уведомлений о статусах и дедлайнах.
 - `OPENAI_API_KEY` - необязательный ключ OpenAI для транскрибации голосовых сообщений Telegram.
 - `OPENAI_TRANSCRIBE_MODEL` - необязательная модель транскрибации, по умолчанию `gpt-4o-transcribe`.
+- `GEMINI_API_KEY` - необязательный ключ Gemini API для транскрибации голосовых сообщений Telegram.
+- `GEMINI_TRANSCRIBE_MODEL` - необязательная модель Gemini для транскрибации, по умолчанию `gemini-3.5-flash`.
 
-Workflow сам загрузит `BOT_TOKEN`, `WEBHOOK_SECRET`, `ONE_C_WEBHOOK_TOKEN`, `ALLOWED_USERS`, `APP_BASE_URL`, `SESSION_SECRET`, `INITIAL_ADMIN_USERNAME`, `INITIAL_ADMIN_PASSWORD`, `TASK_DUE_SOON_HOURS`, `APP_TIMEZONE_OFFSET_HOURS`, `AUDIT_RETENTION_DAYS`, `OPENAI_API_KEY`, `OPENAI_TRANSCRIBE_MODEL` и, если задан, `TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID` в Worker secrets через Wrangler.
+Workflow сам загрузит `BOT_TOKEN`, `WEBHOOK_SECRET`, `ONE_C_WEBHOOK_TOKEN`, `ALLOWED_USERS`, `APP_BASE_URL`, `SESSION_SECRET`, `INITIAL_ADMIN_USERNAME`, `INITIAL_ADMIN_PASSWORD`, `TASK_DUE_SOON_HOURS`, `APP_TIMEZONE_OFFSET_HOURS`, `AUDIT_RETENTION_DAYS`, `OPENAI_API_KEY`, `OPENAI_TRANSCRIBE_MODEL`, `GEMINI_API_KEY`, `GEMINI_TRANSCRIBE_MODEL` и, если задан, `TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID` в Worker secrets через Wrangler.
 
 ## 1С Inbound Webhook
 

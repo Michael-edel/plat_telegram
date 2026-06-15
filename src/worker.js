@@ -24,7 +24,9 @@ import {
 
 const TELEGRAM_WRITE_ROLES = new Set(["admin", "manager", "editor"]);
 const TELEGRAM_AUDIO_LIMIT_BYTES = 25 * 1024 * 1024;
+const GEMINI_INLINE_AUDIO_LIMIT_BYTES = 18 * 1024 * 1024;
 const DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-transcribe";
+const DEFAULT_GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-flash";
 const URL_PATTERN = /https?:\/\/[^\s<>"']+/i;
 
 function json(data, init = {}) {
@@ -705,21 +707,61 @@ async function getTelegramFilePath(env, fileId) {
   return data.result.file_path;
 }
 
-async function transcribeTelegramAudio(env, audio) {
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function geminiTextFromResponse(data) {
+  return String(data?.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("") || "").trim();
+}
+
+async function transcribeWithGemini(env, audioBytes, mimeType) {
+  if (audioBytes.byteLength > GEMINI_INLINE_AUDIO_LIMIT_BYTES) {
+    throw new Error("Аудиофайл слишком большой для Gemini inline transcription. Максимум 18 MB.");
+  }
+  const model = env.GEMINI_TRANSCRIBE_MODEL || DEFAULT_GEMINI_TRANSCRIBE_MODEL;
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-goog-api-key": env.GEMINI_API_KEY,
+    },
+    body: JSON.stringify({
+      contents: [
+        {
+          parts: [
+            { text: "Точно транскрибируй речь из аудио. Верни только текст транскрипции без пояснений." },
+            {
+              inline_data: {
+                mime_type: mimeType || "audio/ogg",
+                data: arrayBufferToBase64(audioBytes),
+              },
+            },
+          ],
+        },
+      ],
+    }),
+  });
+  const data = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new Error(data?.error?.message || "Gemini не смог выполнить транскрибацию.");
+  }
+  const text = geminiTextFromResponse(data);
+  if (!text) {
+    throw new Error("Gemini вернул пустую транскрибацию.");
+  }
+  return text;
+}
+
+async function transcribeWithOpenAI(env, audioBytes, audio) {
   if (!env.OPENAI_API_KEY) {
-    throw new Error("Транскрибация не настроена. Добавьте GitHub secret OPENAI_API_KEY и перезапустите deploy.");
-  }
-  if (audio.file_size && Number(audio.file_size) > TELEGRAM_AUDIO_LIMIT_BYTES) {
-    throw new Error("Аудиофайл слишком большой для транскрибации. Максимум 25 MB.");
-  }
-  const filePath = await getTelegramFilePath(env, audio.file_id);
-  const audioResponse = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${filePath}`);
-  if (!audioResponse.ok) {
-    throw new Error("Не удалось скачать аудио из Telegram.");
-  }
-  const audioBytes = await audioResponse.arrayBuffer();
-  if (audioBytes.byteLength > TELEGRAM_AUDIO_LIMIT_BYTES) {
-    throw new Error("Аудиофайл слишком большой для транскрибации. Максимум 25 MB.");
+    throw new Error("OpenAI транскрибация не настроена.");
   }
   const form = new FormData();
   form.append("model", env.OPENAI_TRANSCRIBE_MODEL || DEFAULT_TRANSCRIBE_MODEL);
@@ -741,6 +783,35 @@ async function transcribeTelegramAudio(env, audio) {
     throw new Error("Транскрибация вернула пустой текст.");
   }
   return text;
+}
+
+async function transcribeTelegramAudio(env, audio) {
+  if (!env.GEMINI_API_KEY && !env.OPENAI_API_KEY) {
+    throw new Error("Транскрибация не настроена. Добавьте GitHub secret GEMINI_API_KEY или OPENAI_API_KEY и перезапустите deploy.");
+  }
+  if (audio.file_size && Number(audio.file_size) > TELEGRAM_AUDIO_LIMIT_BYTES) {
+    throw new Error("Аудиофайл слишком большой для транскрибации. Максимум 25 MB.");
+  }
+  const filePath = await getTelegramFilePath(env, audio.file_id);
+  const audioResponse = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${filePath}`);
+  if (!audioResponse.ok) {
+    throw new Error("Не удалось скачать аудио из Telegram.");
+  }
+  const audioBytes = await audioResponse.arrayBuffer();
+  if (audioBytes.byteLength > TELEGRAM_AUDIO_LIMIT_BYTES) {
+    throw new Error("Аудиофайл слишком большой для транскрибации. Максимум 25 MB.");
+  }
+  const mimeType = audio.mime_type || "audio/ogg";
+
+  if (env.GEMINI_API_KEY && audioBytes.byteLength <= GEMINI_INLINE_AUDIO_LIMIT_BYTES) {
+    try {
+      return await transcribeWithGemini(env, audioBytes, mimeType);
+    } catch (error) {
+      if (!env.OPENAI_API_KEY) throw error;
+      console.error("Gemini transcription failed, falling back to OpenAI", error);
+    }
+  }
+  return await transcribeWithOpenAI(env, audioBytes, audio);
 }
 
 async function handleAudioIntake(env, message, user) {

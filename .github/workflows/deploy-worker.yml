@@ -69,6 +69,12 @@ jobs:
           if [ -n "$OPENAI_TRANSCRIBE_MODEL" ]; then
             printf "%s" "$OPENAI_TRANSCRIBE_MODEL" | npx wrangler secret put OPENAI_TRANSCRIBE_MODEL
           fi
+          if [ -n "$GEMINI_API_KEY" ]; then
+            printf "%s" "$GEMINI_API_KEY" | npx wrangler secret put GEMINI_API_KEY
+          fi
+          if [ -n "$GEMINI_TRANSCRIBE_MODEL" ]; then
+            printf "%s" "$GEMINI_TRANSCRIBE_MODEL" | npx wrangler secret put GEMINI_TRANSCRIBE_MODEL
+          fi
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -86,6 +92,8 @@ jobs:
           TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID: ${{ secrets.TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_TRANSCRIBE_MODEL: ${{ secrets.OPENAI_TRANSCRIBE_MODEL || 'gpt-4o-transcribe' }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_TRANSCRIBE_MODEL: ${{ secrets.GEMINI_TRANSCRIBE_MODEL || 'gemini-3.5-flash' }}
 
       - name: Configure Telegram webhook
         run: node scripts/set-webhook.mjs
