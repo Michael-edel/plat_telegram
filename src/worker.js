@@ -169,12 +169,55 @@ function stripIntakePrefix(text, patterns) {
   return value;
 }
 
+function normalizeNaturalTaskStatus(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (["doing", "работу", "в работе"].includes(normalized)) return "doing";
+  if (["review", "ревью", "проверку", "на проверку"].includes(normalized)) return "review";
+  if (["done", "готово", "закрыто", "завершено"].includes(normalized)) return "done";
+  return "";
+}
+
 export function classifyTelegramIntake(text) {
   const cleanText = String(text || "").trim();
   if (!cleanText) return null;
   const projectMatch = cleanText.match(/^(?:создай|создать|создайте|выбери|выбрать|переключи|переключить)\s+(?:новый\s+)?проект\s+(.+)$/i);
   if (projectMatch?.[1]?.trim()) {
     return { type: "project", text: projectMatch[1].trim() };
+  }
+  const listMatch = cleanText.match(/^(?:покажи|показать|список)\s+(проекты|проектов|задачи|задач|идеи|идей|заметки|заметок|решения|решений|ссылки|ссылок)$/i);
+  if (listMatch) {
+    const target = listMatch[1].toLowerCase();
+    const listType = target.startsWith("проект") ? "projects" : target.startsWith("задач") ? "tasks" : target.startsWith("иде") ? "ideas" : target.startsWith("замет") ? "notes" : target.startsWith("решен") ? "decisions" : "links";
+    return { type: "list", listType };
+  }
+  const statusMatch = cleanText.match(/^(?:переведи|поставь)\s+задач[ауи]?\s+#?(\d+)\s+(?:в|на)\s+(работу|в работе|doing|ревью|review|проверку|на проверку|готово|done)$/i);
+  if (statusMatch) {
+    const status = normalizeNaturalTaskStatus(statusMatch[2]);
+    if (status) return { type: "task_status", taskId: statusMatch[1], status };
+  }
+  const doneMatch = cleanText.match(/^(?:закрой|закрыть|заверши|завершить)\s+задач[ауи]?\s+#?(\d+)$/i);
+  if (doneMatch) {
+    return { type: "task_status", taskId: doneMatch[1], status: "done" };
+  }
+  const commentMatch = cleanText.match(/^(?:добавь|добавить|запиши|написать)?\s*комментарий\s+(?:к\s+)?задач[еуы]?\s+#?(\d+)\s+(.+)$/i);
+  if (commentMatch?.[2]?.trim()) {
+    return { type: "comment", taskId: commentMatch[1], text: commentMatch[2].trim() };
+  }
+  const findMatch = cleanText.match(/^(?:найди|найти|поиск)\s+(.+)$/i);
+  if (findMatch?.[1]?.trim()) {
+    return { type: "find", text: findMatch[1].trim() };
+  }
+  const naturalEntityMatch = cleanText.match(/^(?:создай|создать|создайте|добавь|добавить|сохрани|сохранить|запиши|записать|зафиксируй|зафиксировать)\s+(идею|идея|задачу|задача|заметку|заметка|решение|ссылку|ссылка)\s+(.+)$/i);
+  if (naturalEntityMatch?.[2]?.trim()) {
+    const entity = naturalEntityMatch[1].toLowerCase();
+    const type = entity.startsWith("иде") ? "idea" : entity.startsWith("задач") ? "task" : entity.startsWith("замет") ? "note" : entity.startsWith("решен") ? "decision" : "link";
+    if (type === "link") {
+      const urlMatch = naturalEntityMatch[2].match(URL_PATTERN);
+      if (urlMatch) {
+        return { type: "link", url: urlMatch[0], description: naturalEntityMatch[2].replace(urlMatch[0], "").trim() };
+      }
+    }
+    return { type, text: naturalEntityMatch[2].trim() };
   }
   const urlMatch = cleanText.match(URL_PATTERN);
   if (urlMatch) {
@@ -715,6 +758,28 @@ async function saveAutoIntake(env, message, user, text, source = "telegram_auto"
   if (classified.type === "project") {
     const project = await setActiveProject(env.DB, message.chat.id, classified.text);
     await sendMessage(env, message.chat.id, `Авто: активный проект: ${project.name}`);
+    return;
+  }
+  if (classified.type === "list") {
+    if (classified.listType === "projects") await handleProjects(env, message);
+    else if (classified.listType === "tasks") await handleTasks(env, message);
+    else if (classified.listType === "ideas") await handleEntityList(env, message, "ideas", "Идеи");
+    else if (classified.listType === "notes") await handleEntityList(env, message, "notes", "Заметки");
+    else if (classified.listType === "decisions") await handleEntityList(env, message, "decisions", "Решения");
+    else if (classified.listType === "links") await handleEntityList(env, message, "links", "Ссылки");
+    return;
+  }
+  if (classified.type === "find") {
+    await handleFind(env, withCommandPayload(message, "find", classified.text));
+    return;
+  }
+  if (classified.type === "comment") {
+    await handleComment(env, withCommandPayload(message, "comment", `${classified.taskId} ${classified.text}`), user);
+    return;
+  }
+  if (classified.type === "task_status") {
+    const commandName = classified.status === "doing" ? "task_doing" : classified.status === "review" ? "task_review" : "task_done";
+    await handleTaskStatusCommand(env, withCommandPayload(message, commandName, classified.taskId), user, classified.status, commandName);
     return;
   }
   const project = await requireActiveProject(env, message);

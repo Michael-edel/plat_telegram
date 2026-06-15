@@ -93,6 +93,13 @@ test("classifyTelegramIntake routes free text into project folders", () => {
   assert.deepEqual(classifyTelegramIntake("решение: используем Cloudflare"), { type: "decision", text: "используем Cloudflare" });
   assert.deepEqual(classifyTelegramIntake("заметка: обсудить позже"), { type: "note", text: "обсудить позже" });
   assert.deepEqual(classifyTelegramIntake("Создай проект агенты ИИ"), { type: "project", text: "агенты ИИ" });
+  assert.deepEqual(classifyTelegramIntake("создай задачу проверить склад"), { type: "task", text: "проверить склад" });
+  assert.deepEqual(classifyTelegramIntake("добавь идею Telegram Mini App"), { type: "idea", text: "Telegram Mini App" });
+  assert.deepEqual(classifyTelegramIntake("покажи задачи"), { type: "list", listType: "tasks" });
+  assert.deepEqual(classifyTelegramIntake("найди webhook"), { type: "find", text: "webhook" });
+  assert.deepEqual(classifyTelegramIntake("закрой задачу 42"), { type: "task_status", taskId: "42", status: "done" });
+  assert.deepEqual(classifyTelegramIntake("переведи задачу 7 в ревью"), { type: "task_status", taskId: "7", status: "review" });
+  assert.deepEqual(classifyTelegramIntake("добавь комментарий к задаче 5 проверить повторно"), { type: "comment", taskId: "5", text: "проверить повторно" });
   assert.deepEqual(classifyTelegramIntake("просто информация"), { type: "note", text: "просто информация" });
   assert.equal(classifyTelegramIntake("   "), null);
 });
