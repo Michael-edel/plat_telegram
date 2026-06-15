@@ -946,6 +946,12 @@ function renderUsersPage(users, filters, csrfToken) {
         <td>${escapeHtml(formatDate(user.last_login_at))}</td>
         <td>${user.is_active ? "активен" : "отключён"}</td>
         <td>
+          <form class="inline-form" method="post" action="/app/users/${user.id}/profile">
+            <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+            <input name="display_name" value="${escapeHtml(user.display_name || "")}" placeholder="Имя">
+            <input name="telegram_id" value="${escapeHtml(user.telegram_id || "")}" placeholder="Telegram ID">
+            <button class="secondary">Профиль</button>
+          </form>
           <form class="inline-form" method="post" action="/app/users/${user.id}/role">
             <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
             <select name="role">
@@ -1722,6 +1728,30 @@ async function handleUserRole(env, request, user, targetId) {
   return redirect("/app/users");
 }
 
+async function handleUserProfile(env, request, user, targetId) {
+  if (!isAdmin(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const target = await getUser(env.DB, targetId);
+  if (!target) throw new Error("Пользователь не найден");
+  const displayName = String(data.display_name || "").trim() || null;
+  const telegramId = String(data.telegram_id || "").trim() || null;
+  await env.DB.prepare("UPDATE users SET display_name = ?, telegram_id = ?, updated_at = datetime('now') WHERE id = ?").bind(displayName, telegramId, targetId).run();
+  await auditLog(env.DB, {
+    userId: user.id,
+    action: "user.profile_changed",
+    entityType: "user",
+    entityId: targetId,
+    details: {
+      old_display_name: target.display_name || null,
+      new_display_name: displayName,
+      old_telegram_id: target.telegram_id || null,
+      new_telegram_id: telegramId,
+    },
+  });
+  return redirect("/app/users");
+}
+
 async function handleUserStatus(env, request, user, targetId) {
   if (!isAdmin(user)) return forbiddenResponse(false);
   const data = await readRequestData(request);
@@ -2051,11 +2081,12 @@ export async function handleWebRequest(request, env, ctx = null) {
       return await handleLinkDelete(env, request, user, linkId);
     }
 
-    const userAction = url.pathname.match(/^\/app\/users\/(\d+)\/(role|status|password)$/);
+    const userAction = url.pathname.match(/^\/app\/users\/(\d+)\/(profile|role|status|password)$/);
     const restoreAction = url.pathname.match(/^\/app\/deleted\/([a-z]+)\/(\d+)\/restore$/);
     if (request.method === "POST" && url.pathname === "/app/users") return await handleCreateUser(env, request, user);
     if (request.method === "POST" && userAction) {
       const targetId = Number.parseInt(userAction[1], 10);
+      if (userAction[2] === "profile") return await handleUserProfile(env, request, user, targetId);
       if (userAction[2] === "role") return await handleUserRole(env, request, user, targetId);
       if (userAction[2] === "status") return await handleUserStatus(env, request, user, targetId);
       return await handleUserPassword(env, request, user, targetId);
