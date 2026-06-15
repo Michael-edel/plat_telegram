@@ -626,8 +626,12 @@ async function handleTaskStatusCallback(env, callbackQuery, ctx = null) {
 
 async function handleEntityActionCallback(env, callbackQuery) {
   const userId = callbackQuery.from?.id;
+  const message = callbackQuery.message;
   if (!isAllowed(env, userId)) {
     await answerCallbackQuery(env, callbackQuery.id, "Доступ закрыт.");
+    if (message?.chat?.id) {
+      await sendMessage(env, message.chat.id, "Действие не выполнено: ваш Telegram ID не входит в ALLOWED_USERS.");
+    }
     return;
   }
 
@@ -640,6 +644,13 @@ async function handleEntityActionCallback(env, callbackQuery) {
   const user = await findUserByTelegramId(env.DB, userId);
   if (!canTelegramWrite(user)) {
     await answerCallbackQuery(env, callbackQuery.id, "У вашей роли нет права выполнять действие.");
+    if (message?.chat?.id) {
+      await sendMessage(
+        env,
+        message.chat.id,
+        `Действие не выполнено: Telegram ID ${userId} не связан с активным пользователем web-панели с ролью admin, manager или editor.`,
+      );
+    }
     return;
   }
 
@@ -653,12 +664,19 @@ async function handleEntityActionCallback(env, callbackQuery) {
       });
       if (result.alreadyDeleted) {
         await answerCallbackQuery(env, callbackQuery.id, "Уже в архиве или обработано.");
+        if (message?.chat?.id) {
+          await sendMessage(env, message.chat.id, `${label} #${payload.entityId} уже обработана или находится в архиве.`);
+        }
         return;
       }
       await answerCallbackQuery(env, callbackQuery.id, `Создана задача #${result.task.id}`);
-      const message = callbackQuery.message;
       if (message?.chat?.id && message.message_id) {
         await editMessageText(env, message.chat.id, message.message_id, `${label} #${payload.entityId} конвертирована в задачу #${result.task.id}.`, {
+          reply_markup: taskKeyboard(env, result.task.id, result.task.project_id, result.task.status || "todo"),
+        });
+      }
+      if (message?.chat?.id) {
+        await sendMessage(env, message.chat.id, `Создана задача #${result.task.id} из ${payload.entityType === "idea" ? "идеи" : "ссылки"} #${payload.entityId}.`, {
           reply_markup: taskKeyboard(env, result.task.id, result.task.project_id, result.task.status || "todo"),
         });
       }
@@ -672,16 +690,24 @@ async function handleEntityActionCallback(env, callbackQuery) {
     });
     if (result.alreadyDeleted) {
       await answerCallbackQuery(env, callbackQuery.id, "Уже в архиве.");
+      if (message?.chat?.id) {
+        await sendMessage(env, message.chat.id, `${label} #${payload.entityId} уже находится в архиве.`);
+      }
       return;
     }
     await answerCallbackQuery(env, callbackQuery.id, "Отправлено в архив.");
-    const message = callbackQuery.message;
     if (message?.chat?.id && message.message_id) {
       await editMessageText(env, message.chat.id, message.message_id, `${label} #${payload.entityId} отправлена в архив.`);
+    }
+    if (message?.chat?.id) {
+      await sendMessage(env, message.chat.id, `${label} #${payload.entityId} отправлена в архив.`);
     }
   } catch (error) {
     console.error("Telegram entity action failed", error);
     await answerCallbackQuery(env, callbackQuery.id, "Не удалось выполнить действие.");
+    if (message?.chat?.id) {
+      await sendMessage(env, message.chat.id, `Не удалось выполнить действие: ${error.message || "ошибка обработки"}`);
+    }
   }
 }
 
