@@ -305,8 +305,7 @@ async function handleStart(env, message) {
 async function handleProjectSet(env, message) {
   const name = commandPayload(message);
   if (!name) {
-    await setPendingChatAction(env.DB, message.chat.id, "project_set");
-    await sendMessage(env, message.chat.id, "Укажите название проекта следующим сообщением или одной командой: /project_set название");
+    await requestPendingInput(env, message.chat.id, "project_set", "Укажите название проекта следующим сообщением или одной командой: /project_set название");
     return;
   }
 
@@ -315,7 +314,20 @@ async function handleProjectSet(env, message) {
   await sendMessage(env, message.chat.id, `Активный проект: ${project.name}`);
 }
 
-async function handlePendingChatAction(env, message) {
+async function requestPendingInput(env, chatId, action, prompt) {
+  await setPendingChatAction(env.DB, chatId, action);
+  await sendMessage(env, chatId, prompt);
+}
+
+function withCommandPayload(message, command, payload) {
+  return {
+    ...message,
+    text: `/${command} ${payload}`,
+    caption: "",
+  };
+}
+
+async function handlePendingChatAction(env, message, user, ctx = null) {
   const action = await getPendingChatAction(env.DB, message.chat.id);
   if (!action) return false;
 
@@ -333,8 +345,23 @@ async function handlePendingChatAction(env, message) {
     return true;
   }
 
+  const pendingMessage = withCommandPayload(message, action, text);
   await clearPendingChatAction(env.DB, message.chat.id);
-  return false;
+  if (action === "idea") await handleIdea(env, pendingMessage, user);
+  else if (action === "task") await handleTask(env, pendingMessage, user);
+  else if (action === "note") await handleNote(env, pendingMessage, user);
+  else if (action === "decision") await handleDecision(env, pendingMessage, user);
+  else if (action === "link") await handleLink(env, pendingMessage, user);
+  else if (action === "find") await handleFind(env, pendingMessage);
+  else if (action === "comment") await handleComment(env, pendingMessage, user, ctx);
+  else if (action === "task_doing") await handleTaskStatusCommand(env, pendingMessage, user, "doing", "task_doing", ctx);
+  else if (action === "task_review") await handleTaskStatusCommand(env, pendingMessage, user, "review", "task_review", ctx);
+  else if (action === "task_done") await handleTaskDone(env, pendingMessage, user, ctx);
+  else {
+    return false;
+  }
+
+  return true;
 }
 
 async function handleProjects(env, message) {
@@ -349,7 +376,7 @@ async function handleProjects(env, message) {
 async function handleIdea(env, message, user) {
   const text = commandPayload(message);
   if (!text) {
-    await sendMessage(env, message.chat.id, "Добавьте текст идеи: /idea текст");
+    await requestPendingInput(env, message.chat.id, "idea", "Отправьте текст идеи следующим сообщением или одной командой: /idea текст");
     return;
   }
   const project = await requireActiveProject(env, message);
@@ -363,7 +390,7 @@ async function handleIdea(env, message, user) {
 async function handleTask(env, message, user) {
   const text = commandPayload(message);
   if (!text) {
-    await sendMessage(env, message.chat.id, "Добавьте текст задачи: /task текст");
+    await requestPendingInput(env, message.chat.id, "task", "Отправьте текст задачи следующим сообщением или одной командой: /task текст");
     return;
   }
   const project = await requireActiveProject(env, message);
@@ -406,7 +433,7 @@ async function handleTaskStatusCommand(env, message, user, status, commandName, 
   const payload = commandPayload(message);
   const taskId = Number.parseInt(payload, 10);
   if (!Number.isInteger(taskId)) {
-    await sendMessage(env, message.chat.id, `Укажите id задачи: /${commandName} 1`);
+    await requestPendingInput(env, message.chat.id, commandName, `Отправьте id задачи следующим сообщением или одной командой: /${commandName} 1`);
     return;
   }
 
@@ -454,7 +481,7 @@ async function handleComment(env, message, user, ctx = null) {
   const payload = commandPayload(message);
   const match = payload.match(/^(\d+)\s+([\s\S]+)$/);
   if (!match) {
-    await sendMessage(env, message.chat.id, "Укажите задачу и текст: /comment 42 текст комментария");
+    await requestPendingInput(env, message.chat.id, "comment", "Отправьте id задачи и текст следующим сообщением: 42 текст комментария");
     return;
   }
   const taskId = Number.parseInt(match[1], 10);
@@ -626,7 +653,7 @@ async function handleCallbackQuery(env, callbackQuery, ctx = null) {
 async function handleNote(env, message, user) {
   const text = commandPayload(message);
   if (!text) {
-    await sendMessage(env, message.chat.id, "Добавьте текст заметки: /note текст");
+    await requestPendingInput(env, message.chat.id, "note", "Отправьте текст заметки следующим сообщением или одной командой: /note текст");
     return;
   }
   const project = await requireActiveProject(env, message);
@@ -638,7 +665,7 @@ async function handleNote(env, message, user) {
 async function handleDecision(env, message, user) {
   const text = commandPayload(message);
   if (!text) {
-    await sendMessage(env, message.chat.id, "Добавьте текст решения: /decision текст");
+    await requestPendingInput(env, message.chat.id, "decision", "Отправьте текст решения следующим сообщением или одной командой: /decision текст");
     return;
   }
   const project = await requireActiveProject(env, message);
@@ -650,7 +677,7 @@ async function handleDecision(env, message, user) {
 async function handleLink(env, message, user) {
   const payload = commandPayload(message);
   if (!payload) {
-    await sendMessage(env, message.chat.id, "Добавьте ссылку: /link https://example.com описание");
+    await requestPendingInput(env, message.chat.id, "link", "Отправьте ссылку и описание следующим сообщением или одной командой: /link https://example.com описание");
     return;
   }
 
@@ -905,7 +932,7 @@ async function searchTable(db, table, kind, projectId, query) {
 async function handleFind(env, message) {
   const query = commandPayload(message);
   if (!query) {
-    await sendMessage(env, message.chat.id, "Укажите запрос: /find текст");
+    await requestPendingInput(env, message.chat.id, "find", "Отправьте поисковый запрос следующим сообщением или одной командой: /find текст");
     return;
   }
   const project = await requireActiveProject(env, message);
@@ -941,7 +968,7 @@ async function handleTelegramUpdate(env, update, ctx = null) {
   }
 
   const user = await findUserByTelegramId(env.DB, message.from.id);
-  if (await handlePendingChatAction(env, message)) {
+  if (await handlePendingChatAction(env, message, user, ctx)) {
     return;
   }
 
