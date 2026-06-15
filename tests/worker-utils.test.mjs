@@ -92,6 +92,7 @@ test("classifyTelegramIntake routes free text into project folders", () => {
   assert.deepEqual(classifyTelegramIntake("задача проверить webhook"), { type: "task", text: "проверить webhook" });
   assert.deepEqual(classifyTelegramIntake("решение: используем Cloudflare"), { type: "decision", text: "используем Cloudflare" });
   assert.deepEqual(classifyTelegramIntake("заметка: обсудить позже"), { type: "note", text: "обсудить позже" });
+  assert.deepEqual(classifyTelegramIntake("Создай проект агенты ИИ"), { type: "project", text: "агенты ИИ" });
   assert.deepEqual(classifyTelegramIntake("просто информация"), { type: "note", text: "просто информация" });
   assert.equal(classifyTelegramIntake("   "), null);
 });

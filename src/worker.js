@@ -172,6 +172,10 @@ function stripIntakePrefix(text, patterns) {
 export function classifyTelegramIntake(text) {
   const cleanText = String(text || "").trim();
   if (!cleanText) return null;
+  const projectMatch = cleanText.match(/^(?:создай|создать|создайте|выбери|выбрать|переключи|переключить)\s+(?:новый\s+)?проект\s+(.+)$/i);
+  if (projectMatch?.[1]?.trim()) {
+    return { type: "project", text: projectMatch[1].trim() };
+  }
   const urlMatch = cleanText.match(URL_PATTERN);
   if (urlMatch) {
     return {
@@ -706,6 +710,11 @@ async function saveAutoIntake(env, message, user, text, source = "telegram_auto"
   const classified = classifyTelegramIntake(text);
   if (!classified) {
     await sendMessage(env, message.chat.id, "Не удалось определить текст для сохранения.");
+    return;
+  }
+  if (classified.type === "project") {
+    const project = await setActiveProject(env.DB, message.chat.id, classified.text);
+    await sendMessage(env, message.chat.id, `Авто: активный проект: ${project.name}`);
     return;
   }
   const project = await requireActiveProject(env, message);
