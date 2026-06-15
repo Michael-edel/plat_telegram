@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { createCsrfToken, hashPassword, verifyCsrfToken, verifyPassword } from "../src/auth.js";
 import { timezoneModifier } from "../src/repository.js";
 import { commandPayload, extractHashtags, extractMentions, isTaskStatus, isValidUrl, parseAllowedUsers, taskWebUrl, truncateTelegramText } from "../src/utils.js";
-import { canTelegramWrite, parseEntityActionCallback } from "../src/worker.js";
+import { canTelegramWrite, classifyTelegramIntake, parseEntityActionCallback } from "../src/worker.js";
 import { handleOneCWebhook, validateOneCEnvelope, validateOneCTaskPayload } from "../src/web.js";
 
 test("extractHashtags returns unique lower-case tags", () => {
@@ -84,6 +84,16 @@ test("parseEntityActionCallback accepts only known inline entity actions", () =>
   assert.equal(parseEntityActionCallback("archive_entity:note:4"), null);
   assert.equal(parseEntityActionCallback("convert_to_task:idea:0"), null);
   assert.equal(parseEntityActionCallback("convert_to_task:idea:bad"), null);
+});
+
+test("classifyTelegramIntake routes free text into project folders", () => {
+  assert.deepEqual(classifyTelegramIntake("https://example.com описание"), { type: "link", url: "https://example.com", description: "описание" });
+  assert.deepEqual(classifyTelegramIntake("идея: сделать авторазбор"), { type: "idea", text: "сделать авторазбор" });
+  assert.deepEqual(classifyTelegramIntake("задача проверить webhook"), { type: "task", text: "проверить webhook" });
+  assert.deepEqual(classifyTelegramIntake("решение: используем Cloudflare"), { type: "decision", text: "используем Cloudflare" });
+  assert.deepEqual(classifyTelegramIntake("заметка: обсудить позже"), { type: "note", text: "обсудить позже" });
+  assert.deepEqual(classifyTelegramIntake("просто информация"), { type: "note", text: "просто информация" });
+  assert.equal(classifyTelegramIntake("   "), null);
 });
 
 test("viewer cannot perform Telegram write callbacks", () => {

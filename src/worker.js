@@ -23,6 +23,9 @@ import {
 } from "./repository.js";
 
 const TELEGRAM_WRITE_ROLES = new Set(["admin", "manager", "editor"]);
+const TELEGRAM_AUDIO_LIMIT_BYTES = 25 * 1024 * 1024;
+const DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-transcribe";
+const URL_PATTERN = /https?:\/\/[^\s<>"']+/i;
 
 function json(data, init = {}) {
   return new Response(JSON.stringify(data), {
@@ -156,6 +159,40 @@ export function parseEntityActionCallback(data) {
   return { action: match[1], entityType: match[2], entityId };
 }
 
+function stripIntakePrefix(text, patterns) {
+  let value = String(text || "").trim();
+  for (const pattern of patterns) {
+    value = value.replace(pattern, "").trim();
+  }
+  return value;
+}
+
+export function classifyTelegramIntake(text) {
+  const cleanText = String(text || "").trim();
+  if (!cleanText) return null;
+  const urlMatch = cleanText.match(URL_PATTERN);
+  if (urlMatch) {
+    return {
+      type: "link",
+      url: urlMatch[0],
+      description: cleanText.replace(urlMatch[0], "").replace(/^(ссылка|link)\s*[:\-]?\s*/i, "").trim(),
+    };
+  }
+  if (/^(идея|idea)\s*[:\-]/i.test(cleanText) || /^идея\s+/i.test(cleanText)) {
+    return { type: "idea", text: stripIntakePrefix(cleanText, [/^(идея|idea)\s*[:\-]?\s*/i]) };
+  }
+  if (/^(задача|task)\s*[:\-]/i.test(cleanText) || /^задача\s+/i.test(cleanText)) {
+    return { type: "task", text: stripIntakePrefix(cleanText, [/^(задача|task)\s*[:\-]?\s*/i]) };
+  }
+  if (/^(решение|decision)\s*[:\-]/i.test(cleanText) || /^решение\s+/i.test(cleanText)) {
+    return { type: "decision", text: stripIntakePrefix(cleanText, [/^(решение|decision)\s*[:\-]?\s*/i]) };
+  }
+  if (/^(заметка|note)\s*[:\-]/i.test(cleanText) || /^заметка\s+/i.test(cleanText)) {
+    return { type: "note", text: stripIntakePrefix(cleanText, [/^(заметка|note)\s*[:\-]?\s*/i]) };
+  }
+  return { type: "note", text: cleanText };
+}
+
 async function getTelegramTask(db, taskId) {
   return await db
     .prepare(
@@ -200,7 +237,7 @@ async function requireActiveProject(env, message) {
   return project;
 }
 
-async function createTextEntity(env, table, entityType, projectId, text, authorId = null) {
+async function createTextEntity(env, table, entityType, projectId, text, authorId = null, source = "telegram") {
   const cleanText = text.trim();
   if (!cleanText) {
     throw new Error("Текст не может быть пустым");
@@ -212,7 +249,7 @@ async function createTextEntity(env, table, entityType, projectId, text, authorI
     projectId,
     text: cleanText,
     authorId,
-    source: "telegram",
+    source,
   });
 }
 
@@ -593,6 +630,132 @@ async function handleLink(env, message, user) {
   });
 }
 
+async function saveAutoIntake(env, message, user, text, source = "telegram_auto") {
+  const classified = classifyTelegramIntake(text);
+  if (!classified) {
+    await sendMessage(env, message.chat.id, "Не удалось определить текст для сохранения.");
+    return;
+  }
+  const project = await requireActiveProject(env, message);
+  if (!project) return;
+  const authorName = user?.username || message.from.username || message.from.first_name || "—";
+
+  if (classified.type === "link") {
+    const link = await createLink(env.DB, {
+      projectId: project.id,
+      url: classified.url,
+      description: classified.description,
+      authorId: user?.id || null,
+      source,
+    });
+    await sendMessage(env, message.chat.id, `Авто: ссылка #${link.id} сохранена в проекте ${project.name}. Автор: ${authorName}`, {
+      reply_markup: entityActionKeyboard("link", link.id),
+    });
+    return;
+  }
+
+  if (classified.type === "idea") {
+    const idea = await createTextEntity(env, "ideas", "idea", project.id, classified.text, user?.id || null, source);
+    await sendMessage(env, message.chat.id, `Авто: идея #${idea.id} сохранена в проекте ${project.name}. Автор: ${authorName}`, {
+      reply_markup: entityActionKeyboard("idea", idea.id),
+    });
+    return;
+  }
+
+  if (classified.type === "task") {
+    const task = await createTask(env.DB, {
+      projectId: project.id,
+      text: classified.text,
+      authorId: user?.id || null,
+      source,
+    });
+    await sendMessage(env, message.chat.id, `Авто: ${taskSummary(task, project.name, authorName)}`, {
+      reply_markup: taskKeyboard(env, task.id, project.id, task.status || "todo"),
+    });
+    return;
+  }
+
+  if (classified.type === "decision") {
+    const decision = await createTextEntity(env, "decisions", "decision", project.id, classified.text, user?.id || null, source);
+    await sendMessage(env, message.chat.id, `Авто: решение #${decision.id} сохранено в проекте ${project.name}. Автор: ${authorName}`);
+    return;
+  }
+
+  const note = await createTextEntity(env, "notes", "note", project.id, classified.text, user?.id || null, source);
+  await sendMessage(env, message.chat.id, `Авто: заметка #${note.id} сохранена в проекте ${project.name}. Автор: ${authorName}`);
+}
+
+function audioFileName(audio) {
+  const name = String(audio.file_name || "").trim();
+  if (name) return name;
+  const mime = String(audio.mime_type || "");
+  if (mime.includes("mpeg") || mime.includes("mp3")) return "telegram-audio.mp3";
+  if (mime.includes("mp4") || mime.includes("m4a")) return "telegram-audio.m4a";
+  if (mime.includes("wav")) return "telegram-audio.wav";
+  if (mime.includes("webm")) return "telegram-audio.webm";
+  return "telegram-voice.ogg";
+}
+
+async function getTelegramFilePath(env, fileId) {
+  const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`);
+  const data = await response.json().catch(() => null);
+  if (!response.ok || !data?.ok || !data.result?.file_path) {
+    throw new Error("Telegram не вернул файл для транскрибации.");
+  }
+  return data.result.file_path;
+}
+
+async function transcribeTelegramAudio(env, audio) {
+  if (!env.OPENAI_API_KEY) {
+    throw new Error("Транскрибация не настроена. Добавьте GitHub secret OPENAI_API_KEY и перезапустите deploy.");
+  }
+  if (audio.file_size && Number(audio.file_size) > TELEGRAM_AUDIO_LIMIT_BYTES) {
+    throw new Error("Аудиофайл слишком большой для транскрибации. Максимум 25 MB.");
+  }
+  const filePath = await getTelegramFilePath(env, audio.file_id);
+  const audioResponse = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${filePath}`);
+  if (!audioResponse.ok) {
+    throw new Error("Не удалось скачать аудио из Telegram.");
+  }
+  const audioBytes = await audioResponse.arrayBuffer();
+  if (audioBytes.byteLength > TELEGRAM_AUDIO_LIMIT_BYTES) {
+    throw new Error("Аудиофайл слишком большой для транскрибации. Максимум 25 MB.");
+  }
+  const form = new FormData();
+  form.append("model", env.OPENAI_TRANSCRIBE_MODEL || DEFAULT_TRANSCRIBE_MODEL);
+  form.append("file", new Blob([audioBytes], { type: audio.mime_type || "audio/ogg" }), audioFileName(audio));
+  form.append("response_format", "json");
+
+  const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
+    body: form,
+  });
+  const data = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message = data?.error?.message || "OpenAI не смог выполнить транскрибацию.";
+    throw new Error(message);
+  }
+  const text = String(data?.text || "").trim();
+  if (!text) {
+    throw new Error("Транскрибация вернула пустой текст.");
+  }
+  return text;
+}
+
+async function handleAudioIntake(env, message, user) {
+  const audio = message.voice || message.audio;
+  try {
+    await sendMessage(env, message.chat.id, "Голос получен. Выполняю транскрибацию...");
+    const text = await transcribeTelegramAudio(env, audio);
+    await saveAutoIntake(env, message, user, text, "telegram_voice");
+    await sendMessage(env, message.chat.id, `Транскрибация:\n${text}`);
+  } catch (error) {
+    console.error("Telegram audio transcription failed", error);
+    await sendMessage(env, message.chat.id, error.message || "Не удалось обработать голосовое сообщение.");
+  }
+}
+
 async function handleEntityList(env, message, table, label) {
   const project = await requireActiveProject(env, message);
   if (!project) return;
@@ -665,7 +828,16 @@ async function handleTelegramUpdate(env, update, ctx = null) {
 
   const user = await findUserByTelegramId(env.DB, message.from.id);
 
+  if (message.voice || message.audio) {
+    await handleAudioIntake(env, message, user);
+    return;
+  }
+
   const text = message.text || message.caption || "";
+  if (text.trim() && !text.trim().startsWith("/")) {
+    await saveAutoIntake(env, message, user, text);
+    return;
+  }
   const command = text.split(/\s+/, 1)[0].split("@", 1)[0];
 
   switch (command) {

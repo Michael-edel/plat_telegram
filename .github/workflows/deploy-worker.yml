@@ -63,6 +63,12 @@ jobs:
           if [ -n "$TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID" ]; then
             printf "%s" "$TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID" | npx wrangler secret put TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID
           fi
+          if [ -n "$OPENAI_API_KEY" ]; then
+            printf "%s" "$OPENAI_API_KEY" | npx wrangler secret put OPENAI_API_KEY
+          fi
+          if [ -n "$OPENAI_TRANSCRIBE_MODEL" ]; then
+            printf "%s" "$OPENAI_TRANSCRIBE_MODEL" | npx wrangler secret put OPENAI_TRANSCRIBE_MODEL
+          fi
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -78,6 +84,8 @@ jobs:
           APP_TIMEZONE_OFFSET_HOURS: ${{ secrets.APP_TIMEZONE_OFFSET_HOURS || '5' }}
           AUDIT_RETENTION_DAYS: ${{ secrets.AUDIT_RETENTION_DAYS || '90' }}
           TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID: ${{ secrets.TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_TRANSCRIBE_MODEL: ${{ secrets.OPENAI_TRANSCRIBE_MODEL || 'gpt-4o-transcribe' }}
 
       - name: Configure Telegram webhook
         run: node scripts/set-webhook.mjs

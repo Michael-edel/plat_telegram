@@ -36,6 +36,16 @@
 Команды `/idea`, `/task`, `/note`, `/decision` и `/link` поддерживают reply-режим.
 После создания задачи бот показывает inline-кнопки для перевода задачи в `doing`, `review` и `done`; команды `/task_doing`, `/task_review` и `/task_done` оставлены для совместимости.
 
+Обычный текст без slash-команды автоматически распределяется по разделам активного проекта:
+
+- сообщение с `http://` или `https://` сохраняется как ссылка;
+- `идея: текст` или `идея текст` сохраняется в идеи;
+- `задача: текст` или `задача текст` создаёт задачу;
+- `решение: текст` или `решение текст` сохраняется в решения;
+- `заметка: текст` или любой другой текст сохраняется в заметки.
+
+Голосовые сообщения и аудио транскрибируются через OpenAI Speech-to-Text, затем проходят через те же правила авто-распределения. Для этого нужен Worker secret `OPENAI_API_KEY`.
+
 ## Веб-панель и роли
 
 Панель предназначена для внутренней работы двух партнёров и закрыта логином/паролем.
@@ -235,8 +245,10 @@ Settings -> Secrets and variables -> Actions -> New repository secret
 - `APP_TIMEZONE_OFFSET_HOURS` - смещение локального времени для расчёта дедлайнов, по умолчанию `5`.
 - `AUDIT_RETENTION_DAYS` - сколько дней хранить аудит и историю изменений, по умолчанию `90`.
 - `TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID` - необязательный общий чат/канал для уведомлений о статусах и дедлайнах.
+- `OPENAI_API_KEY` - необязательный ключ OpenAI для транскрибации голосовых сообщений Telegram.
+- `OPENAI_TRANSCRIBE_MODEL` - необязательная модель транскрибации, по умолчанию `gpt-4o-transcribe`.
 
-Workflow сам загрузит `BOT_TOKEN`, `WEBHOOK_SECRET`, `ONE_C_WEBHOOK_TOKEN`, `ALLOWED_USERS`, `APP_BASE_URL`, `SESSION_SECRET`, `INITIAL_ADMIN_USERNAME`, `INITIAL_ADMIN_PASSWORD`, `TASK_DUE_SOON_HOURS`, `APP_TIMEZONE_OFFSET_HOURS`, `AUDIT_RETENTION_DAYS` и, если задан, `TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID` в Worker secrets через Wrangler.
+Workflow сам загрузит `BOT_TOKEN`, `WEBHOOK_SECRET`, `ONE_C_WEBHOOK_TOKEN`, `ALLOWED_USERS`, `APP_BASE_URL`, `SESSION_SECRET`, `INITIAL_ADMIN_USERNAME`, `INITIAL_ADMIN_PASSWORD`, `TASK_DUE_SOON_HOURS`, `APP_TIMEZONE_OFFSET_HOURS`, `AUDIT_RETENTION_DAYS`, `OPENAI_API_KEY`, `OPENAI_TRANSCRIBE_MODEL` и, если задан, `TELEGRAM_NOTIFY_OVERVIEW_CHAT_ID` в Worker secrets через Wrangler.
 
 ## 1С Inbound Webhook
 
