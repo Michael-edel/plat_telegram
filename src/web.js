@@ -935,10 +935,12 @@ function renderProject(project, data, searchResults, filters, filterOptions, use
     </div>${focusScript}`;
 }
 
-function renderUsersPage(users, filters, csrfToken) {
+function renderUsersPage(users, filters, csrfToken, currentUser) {
   const rows = users
     .map(
-      (user) => `<tr>
+      (user) => {
+        const canDelete = String(user.id) !== String(currentUser.id) && user.username !== INTEGRATION_1C_USERNAME;
+        return `<tr>
         <td>${user.id}</td>
         <td>${escapeHtml(user.username)}<br><span class="muted">${escapeHtml(user.display_name || "")}</span></td>
         <td>${roleBadge(user)}</td>
@@ -950,7 +952,7 @@ function renderUsersPage(users, filters, csrfToken) {
             <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
             <input name="display_name" value="${escapeHtml(user.display_name || "")}" placeholder="Имя">
             <input name="telegram_id" value="${escapeHtml(user.telegram_id || "")}" placeholder="Telegram ID">
-            <button class="secondary">Профиль</button>
+            <button class="secondary">Сохранить профиль</button>
           </form>
           <form class="inline-form" method="post" action="/app/users/${user.id}/role">
             <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
@@ -969,8 +971,17 @@ function renderUsersPage(users, filters, csrfToken) {
             <input name="password" type="password" placeholder="Новый пароль" required>
             <button class="secondary">Пароль</button>
           </form>
+          ${
+            canDelete
+              ? `<form method="post" action="/app/users/${user.id}/delete" onsubmit="return confirm('Удалить пользователя ${escapeHtml(user.username)}? Это действие нельзя отменить.');">
+                  <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+                  <button class="danger">Удалить</button>
+                </form>`
+              : `<span class="muted">Удаление недоступно</span>`
+          }
         </td>
-      </tr>`,
+      </tr>`;
+      },
     )
     .join("");
 
@@ -1644,7 +1655,7 @@ async function handleUsersPage(env, request, user) {
   const csrfToken = await createCsrfToken(env);
   const headers = new Headers();
   appendSetCookie(headers, createCsrfCookie(csrfToken));
-  return html(renderLayout({ title: "Пользователи", content: renderUsersPage(users, filters, csrfToken), user, csrfToken }), { headers });
+  return html(renderLayout({ title: "Пользователи", content: renderUsersPage(users, filters, csrfToken, user), user, csrfToken }), { headers });
 }
 
 async function handleAuditPage(env, request, user) {
@@ -1717,6 +1728,9 @@ async function handleUserRole(env, request, user, targetId) {
   const target = await getUser(env.DB, targetId);
   const role = String(data.role || "");
   if (!target || !ROLES.includes(role)) throw new Error("Некорректная роль");
+  if (Number(targetId) === Number(user.id) && role !== "admin") {
+    throw new Error("Нельзя снять роль admin у текущего пользователя.");
+  }
   await env.DB.prepare("UPDATE users SET role = ?, updated_at = datetime('now') WHERE id = ?").bind(role, targetId).run();
   await auditLog(env.DB, {
     userId: user.id,
@@ -1757,6 +1771,9 @@ async function handleUserStatus(env, request, user, targetId) {
   const data = await readRequestData(request);
   await requireCsrf(request, env, data);
   const isActive = String(data.is_active) === "1" ? 1 : 0;
+  if (Number(targetId) === Number(user.id) && !isActive) {
+    throw new Error("Нельзя отключить текущего пользователя.");
+  }
   await env.DB.prepare("UPDATE users SET is_active = ?, updated_at = datetime('now') WHERE id = ?").bind(isActive, targetId).run();
   await auditLog(env.DB, {
     userId: user.id,
@@ -1764,6 +1781,33 @@ async function handleUserStatus(env, request, user, targetId) {
     entityType: "user",
     entityId: targetId,
   });
+  return redirect("/app/users");
+}
+
+async function handleUserDelete(env, request, user, targetId) {
+  if (!isAdmin(user)) return forbiddenResponse(false);
+  const data = await readRequestData(request);
+  await requireCsrf(request, env, data);
+  const target = await getUser(env.DB, targetId);
+  if (!target) throw new Error("Пользователь не найден");
+  if (Number(targetId) === Number(user.id)) {
+    throw new Error("Нельзя удалить текущего пользователя.");
+  }
+  if (target.username === INTEGRATION_1C_USERNAME) {
+    throw new Error("Нельзя удалить служебного пользователя 1С.");
+  }
+  const activeAdmin = await env.DB.prepare("SELECT COUNT(*) AS count FROM users WHERE role = 'admin' AND is_active = 1 AND id <> ?").bind(targetId).first();
+  if (target.role === "admin" && Number(activeAdmin?.count || 0) < 1) {
+    throw new Error("Нельзя удалить последнего активного admin.");
+  }
+  await auditLog(env.DB, {
+    userId: user.id,
+    action: "user.deleted",
+    entityType: "user",
+    entityId: targetId,
+    details: { username: target.username, role: target.role, telegram_id: target.telegram_id || null },
+  });
+  await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(targetId).run();
   return redirect("/app/users");
 }
 
@@ -2081,7 +2125,7 @@ export async function handleWebRequest(request, env, ctx = null) {
       return await handleLinkDelete(env, request, user, linkId);
     }
 
-    const userAction = url.pathname.match(/^\/app\/users\/(\d+)\/(profile|role|status|password)$/);
+    const userAction = url.pathname.match(/^\/app\/users\/(\d+)\/(profile|role|status|password|delete)$/);
     const restoreAction = url.pathname.match(/^\/app\/deleted\/([a-z]+)\/(\d+)\/restore$/);
     if (request.method === "POST" && url.pathname === "/app/users") return await handleCreateUser(env, request, user);
     if (request.method === "POST" && userAction) {
@@ -2089,6 +2133,7 @@ export async function handleWebRequest(request, env, ctx = null) {
       if (userAction[2] === "profile") return await handleUserProfile(env, request, user, targetId);
       if (userAction[2] === "role") return await handleUserRole(env, request, user, targetId);
       if (userAction[2] === "status") return await handleUserStatus(env, request, user, targetId);
+      if (userAction[2] === "delete") return await handleUserDelete(env, request, user, targetId);
       return await handleUserPassword(env, request, user, targetId);
     }
     if (request.method === "POST" && restoreAction) {
